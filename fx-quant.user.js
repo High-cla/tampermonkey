@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FX 简单! · 量化辅助台
 // @namespace    https://www.bilibilitoy.com/toy/fx-simple
-// @version      1.2.0
+// @version      1.3.0
 // @description  B站「FX 简单!」量化辅助：漂移相位引擎（白盒）+ 技术指标引擎（黑盒）+ 新闻偏置加权 + 三级自动化
 // @author       fxq
 // @match        https://www.bilibilitoy.com/toy/fx-simple/*
@@ -87,6 +87,21 @@
   const DRIFT_MIN_BARS = 8;
   const DRIFT_MAX_BARS = 30;
   const DRIFT_MIN_SUM = 0.0015;
+  const DRIFT_STEP = TICK_MS / DRIFT_DIV;
+  // 闭式解：Σ_{k=0..H-1} sin(θ+kΔ) = sin(HΔ/2)/sin(Δ/2) · sin(θ+(H-1)Δ/2)
+  // 再套和角公式，每品种每轮只需 2 次三角函数，其余全查表（原实现是 ΣH=437 次 sin/品种）
+  const DRIFT_TABLES = (() => {
+    const half = Math.sin(DRIFT_STEP / 2);
+    const amp = [0], cosPhi = [0], sinPhi = [0], root = [0];
+    for (let h = 1; h <= DRIFT_MAX_BARS; h++) {
+      amp[h] = DRIFT_AMP * Math.sin(h * DRIFT_STEP / 2) / half;
+      const phi = (h - 1) * DRIFT_STEP / 2;
+      cosPhi[h] = Math.cos(phi);
+      sinPhi[h] = Math.sin(phi);
+      root[h] = Math.sqrt(h);
+    }
+    return { amp, cosPhi, sinPhi, root };
+  })();
   const LOOKAHEAD_HORIZON = 3;
   const LOOKAHEAD_SCALE = 0.004;
   const MIN_BARS_FOR_SIGNAL = 30;
@@ -119,8 +134,9 @@
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
   const finite = v => typeof v === 'number' && Number.isFinite(v);
   const feeRate = lev => lev * (0.00005 + lev * 0.000005);
-  const money = n => (n < 0 ? '-$' : '$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const signedMoney = n => (n >= 0 ? '+$' : '-$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const MONEY_FMT = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const money = n => (n < 0 ? '-$' : '$') + MONEY_FMT.format(Math.abs(n));
+  const signedMoney = n => (n >= 0 ? '+$' : '-$') + MONEY_FMT.format(Math.abs(n));
   const priceText = (pair, v) => finite(v) ? v.toFixed(DIGITS[pair] || 5) : '—';
 
   function setText(node, text, cls) {
@@ -142,7 +158,7 @@
   }
   const cfg = loadConfig();
   const saveConfig = () => {
-    try { PAGE.localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (_) {}
+    try { PAGE.localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (_) {}   // 预期内：隐私模式/配额满，设置不持久化
   };
 
   const logLines = [];
@@ -153,7 +169,19 @@
     lastLogAt = now; lastLogMsg = msg;
     logLines.unshift(new Date().toLocaleTimeString('zh-CN', { hour12: false }) + '  ' + msg);
     if (logLines.length > MAX_LOG) logLines.length = MAX_LOG;
-    if (ui.ready) ui.log.textContent = logLines.slice(0, 6).join(String.fromCharCode(10));
+    if (ui.ready) ui.log.textContent = logLines.slice(0, 6).join('\n');
+  }
+
+  // 非预期异常的显性化出口：预期内的降级路径仍静默（见各处 catch 注释），
+  // 非预期的走这里留痕，面板可查，不再无声消失
+  const debugLog = [];
+  function safe(label, fn, fallback) {
+    try { return fn(); }
+    catch (err) {
+      if (debugLog.length >= 20) debugLog.shift();
+      debugLog.push(label + ': ' + (err && err.message ? err.message : String(err)));
+      return fallback;
+    }
   }
 
   /* ---------------------------------------------- 桥：页面内部 API 通道 */
@@ -196,7 +224,10 @@
         node.textContent = '(' + pageWorldPolyfill.toString() + ')(window);';
         host.appendChild(node);
         node.remove();
-      } catch (_) {}
+      } catch (err) {
+        // 预期内降级：CSP 禁止内联脚本时走 unsafeWindow 直挂通道，但留痕便于排查
+        log('主世界注入被阻断，改用直挂通道：' + (err && err.message ? err.message : err));
+      }
     };
     inject();
   }
@@ -246,7 +277,7 @@
       }
     } catch (_) {}
 
-    try { BRIDGE.lastSave = PAGE.localStorage.getItem(SAVE_KEY) || ''; } catch (_) {}
+    try { BRIDGE.lastSave = PAGE.localStorage.getItem(SAVE_KEY) || ''; } catch (_) {}   // 预期内：存储被禁则只走 API 通道
   }
 
   const TOOL_OK = 0, TOOL_MISSING = 1, TOOL_FAILED = 2;
@@ -280,13 +311,19 @@
   const sampled = new Map();
   let lastSampleAt = 0;
 
+  let saveCache = { raw: null, data: null };
+
   function readSave() {
     try {
       let raw = BRIDGE.lastSave;
-      if (!raw) { try { raw = (PAGE.__FXQ_PAGE__ && PAGE.__FXQ_PAGE__.lastSave) || ''; } catch (_) {} }
+      if (!raw) raw = (PAGE.__FXQ_PAGE__ && PAGE.__FXQ_PAGE__.lastSave) || '';
       if (!raw) raw = PAGE.localStorage.getItem(SAVE_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch (_) { return null; }
+      // 引用相等即短路：游戏每 1.5s 才换新字符串，7 个品种的查询共享一次解析
+      if (raw === saveCache.raw) return saveCache.data;
+      const data = raw ? JSON.parse(raw) : null;
+      saveCache = { raw, data };
+      return data;
+    } catch (_) { return null; }   // 脏存档属预期：返回 null 由调用方降级
   }
 
   function readDomMoney(id) {
@@ -492,19 +529,20 @@
 
   // Σ_{k=0..H-1} sin((t0 + k*TICK)/DIV + idx*2 + phase) * AMP
   function driftSum(t0, index, horizon, marketPhase) {
-    let sum = 0;
-    for (let k = 0; k < horizon; k++) {
-      sum += Math.sin((t0 + k * TICK_MS) / DRIFT_DIV + index * 2 + marketPhase) * DRIFT_AMP;
-    }
-    return sum;
+    if (horizon < 1 || horizon > DRIFT_MAX_BARS) return 0;
+    const theta0 = t0 / DRIFT_DIV + index * 2 + marketPhase;
+    const phi = (horizon - 1) * DRIFT_STEP / 2;
+    return DRIFT_TABLES.amp[horizon] * Math.sin(theta0 + phi);
   }
 
   // 最优持有期：最大化 漂移累积 / 噪声(∝√H)，即信噪比
   function bestDrift(t0, index, marketPhase) {
+    const theta0 = t0 / DRIFT_DIV + index * 2 + marketPhase;
+    const s = Math.sin(theta0), c = Math.cos(theta0);
     let best = { horizon: 0, sum: 0, ratio: 0 };
     for (let h = DRIFT_MIN_BARS; h <= DRIFT_MAX_BARS; h++) {
-      const sum = driftSum(t0, index, h, marketPhase);
-      const ratio = Math.abs(sum) / Math.sqrt(h);
+      const sum = DRIFT_TABLES.amp[h] * (s * DRIFT_TABLES.cosPhi[h] + c * DRIFT_TABLES.sinPhi[h]);
+      const ratio = Math.abs(sum) / DRIFT_TABLES.root[h];
       if (ratio > best.ratio) best = { horizon: h, sum, ratio };
     }
     return best;
@@ -998,17 +1036,7 @@
     return node;
   }
 
-  function buildUI() {
-    if (ui.ready) return;
-    const host = PAGE.document.body;
-    if (!host) return;
-
-    const style = make('style');
-    style.textContent = CSS;
-    PAGE.document.head.appendChild(style);
-
-    const root = make('div', 'fxq-panel');
-    root.innerHTML = [
+  const PANEL_HTML = [
       '<div class="fxq-head"><span class="fxq-dot" data-fxq="dot"></span>',
       '<span class="fxq-title">FX 量化辅助台</span>',
       '<button class="fxq-btn" data-fxq="fold">—</button></div>',
@@ -1051,9 +1079,9 @@
       '  <div class="fxq-pos" data-fxq="posline">无持仓</div>',
       '  <div class="fxq-log" data-fxq="log"></div>',
       '</div>'
-    ].join('');
-    host.appendChild(root);
+  ].join('');
 
+  function bindRefs(root) {
     const q = key => root.querySelector('[data-fxq="' + key + '"]');
     Object.assign(ui, {
       ready: true, root,
@@ -1065,7 +1093,9 @@
       autoOff: q('auto-off'), autoConfirm: q('auto-confirm'), autoAuto: q('auto-auto'),
       exec: q('exec'), closeall: q('closeall'), fast: q('fast'), fold: q('fold')
     });
+  }
 
+  function wireEvents(root) {
     ui.fold.addEventListener('click', () => {
       ui.collapsed = !ui.collapsed;
       root.classList.toggle('fxq-collapsed', ui.collapsed);
@@ -1122,6 +1152,20 @@
     });
 
     makeDraggable(root, root.querySelector('.fxq-head'));
+  }
+
+  function buildUI() {
+    if (ui.ready) return;
+    const host = PAGE.document.body;
+    if (!host) return;
+    const style = make('style');
+    style.textContent = CSS;
+    PAGE.document.head.appendChild(style);
+    const root = make('div', 'fxq-panel');
+    root.innerHTML = PANEL_HTML;
+    host.appendChild(root);
+    bindRefs(root);
+    wireEvents(root);
     renderAutomation();
   }
 
@@ -1181,80 +1225,86 @@
     setText(ui.via, BRIDGE.via === 'api' ? '通道 · 内部 API' : '通道 · DOM 兜底');
     setText(ui.mode, MODE_LABEL[snap.mode] || snap.mode);
     setText(ui.k1, isDriftMode(snap.mode) ? '漂移累积' : 'EMA12/26');
+    if (isDriftMode(snap.mode)) renderDriftPanel(snap, ctx, plan);
+    else renderIndicatorPanel(snap, ctx, plan);
+    renderAccountPanel(snap);
+  }
 
+  function renderDriftPanel(snap, ctx, plan) {
     const top = ctx.drift[0];
-    if (isDriftMode(snap.mode)) {
-      if (top) {
-        const pct = (top.value * 100).toFixed(2);
-        setText(ui.sig, top.pair + (top.side === 1 ? ' 多' : ' 空') + ' ' + (top.side === 1 ? '+' : '') + pct + '%',
-          'fxq-sig ' + (top.side === 1 ? 'fxq-up' : 'fxq-down'));
-        const half = clamp(Math.abs(top.value) / 0.006 * 50, 0, 50);
-        setStyle(ui.bar, 'left', top.side === 1 ? '50%' : (50 - half) + '%');
-        setStyle(ui.bar, 'width', half + '%');
-        setStyle(ui.bar, 'background', top.side === 1 ? '#57cf9b' : '#ef8ba0');
-        setText(ui.ema, (top.value * 100).toFixed(2) + '%', top.side === 1 ? 'fxq-up' : 'fxq-down');
-        setText(ui.src, '漂移相位 · H=' + top.horizon + 't');
-        setText(ui.rsi, '—');
-        setText(ui.atr, '—');
-        setText(ui.macd, String(ctx.drift.length) + ' 个', '');
-        setText(ui.boll, '—');
-        setText(ui.roc, '—', '');
-      } else {
-        setText(ui.sig, '无漂移窗口', 'fxq-sig');
-        setStyle(ui.bar, 'width', '0');
-        clearIndicators();
-      }
-      setText(ui.advice, plan
-        ? plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' · ' + money(plan.margin) + ' · ' + plan.leverage + '×' + plan.note
-        : (snap.positions.length ? '持仓管理中 · ' + snap.positions.length + ' 笔' : '漂移累积不足 ' + (DRIFT_MIN_SUM * 100).toFixed(2) + '%'),
-        'fxq-advice' + (plan && plan.side < 0 ? ' sell' : ''));
+    if (top) {
+      const pct = (top.value * 100).toFixed(2);
+      setText(ui.sig, top.pair + (top.side === 1 ? ' 多' : ' 空') + ' ' + (top.side === 1 ? '+' : '') + pct + '%',
+        'fxq-sig ' + (top.side === 1 ? 'fxq-up' : 'fxq-down'));
+      const half = clamp(Math.abs(top.value) / 0.006 * 50, 0, 50);
+      setStyle(ui.bar, 'left', top.side === 1 ? '50%' : (50 - half) + '%');
+      setStyle(ui.bar, 'width', half + '%');
+      setStyle(ui.bar, 'background', top.side === 1 ? '#57cf9b' : '#ef8ba0');
+      setText(ui.ema, (top.value * 100).toFixed(2) + '%', top.side === 1 ? 'fxq-up' : 'fxq-down');
+      setText(ui.src, '漂移相位 · H=' + top.horizon + 't');
+      setText(ui.rsi, '—');
+      setText(ui.atr, '—');
+      setText(ui.macd, ctx.drift.length + ' 个', '');
+      setText(ui.boll, '—');
+      setText(ui.roc, '—', '');
     } else {
-      const ind = ctx.best;
-      if (!ind) {
-        setText(ui.sig, '数据积累中', 'fxq-sig');
-        setStyle(ui.bar, 'left', '50%');
-        setStyle(ui.bar, 'width', '0');
-        clearIndicators();
-        setText(ui.advice, '等待 K 线数据…', 'fxq-advice');
-      } else {
-        const score = ind.score;
-        const label = score >= 55 ? '强多' : score >= SIGNAL_THRESHOLD ? '偏多'
-          : score <= -55 ? '强空' : score <= -SIGNAL_THRESHOLD ? '偏空' : '中性';
-        setText(ui.sig, label + ' ' + (score >= 0 ? '+' : '') + score.toFixed(0),
-          'fxq-sig ' + (score > 0 ? 'fxq-up' : score < 0 ? 'fxq-down' : ''));
-        const half = Math.abs(score) / 100 * 50;
-        setStyle(ui.bar, 'left', score >= 0 ? '50%' : (50 - half) + '%');
-        setStyle(ui.bar, 'width', half + '%');
-        setStyle(ui.bar, 'background', score >= 0 ? '#57cf9b' : '#ef8ba0');
-        renderIndicators(ind);
-        setText(ui.advice, plan
-          ? plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' · 保证金 ' + money(plan.margin) + ' · ' + plan.leverage + '×' + plan.note
-          : (snap.positions.length ? '持仓管理中 · ' + snap.positions.length + ' 笔' : '无信号（|评分| < ' + SIGNAL_THRESHOLD + '）'),
-          'fxq-advice' + (plan && plan.side < 0 ? ' sell' : ''));
-      }
+      setText(ui.sig, '无漂移窗口', 'fxq-sig');
+      setStyle(ui.bar, 'width', '0');
+      clearIndicators();
     }
+    setText(ui.advice, plan
+      ? plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' · ' + money(plan.margin) + ' · ' + plan.leverage + '×' + plan.note
+      : (snap.positions.length ? '持仓管理中 · ' + snap.positions.length + ' 笔' : '漂移累积不足 ' + (DRIFT_MIN_SUM * 100).toFixed(2) + '%'),
+      'fxq-advice' + (plan && plan.side < 0 ? ' sell' : ''));
+  }
 
+  function renderIndicatorPanel(snap, ctx, plan) {
+    const ind = ctx.best;
+    if (!ind) {
+      setText(ui.sig, '数据积累中', 'fxq-sig');
+      setStyle(ui.bar, 'left', '50%');
+      setStyle(ui.bar, 'width', '0');
+      clearIndicators();
+      setText(ui.advice, '等待 K 线数据…', 'fxq-advice');
+      return;
+    }
+    const score = ind.score;
+    const label = score >= 55 ? '强多' : score >= SIGNAL_THRESHOLD ? '偏多'
+      : score <= -55 ? '强空' : score <= -SIGNAL_THRESHOLD ? '偏空' : '中性';
+    setText(ui.sig, label + ' ' + (score >= 0 ? '+' : '') + score.toFixed(0),
+      'fxq-sig ' + (score > 0 ? 'fxq-up' : score < 0 ? 'fxq-down' : ''));
+    const half = Math.abs(score) / 100 * 50;
+    setStyle(ui.bar, 'left', score >= 0 ? '50%' : (50 - half) + '%');
+    setStyle(ui.bar, 'width', half + '%');
+    setStyle(ui.bar, 'background', score >= 0 ? '#57cf9b' : '#ef8ba0');
+    renderIndicators(ind);
+    setText(ui.advice, plan
+      ? plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' · 保证金 ' + money(plan.margin) + ' · ' + plan.leverage + '×' + plan.note
+      : (snap.positions.length ? '持仓管理中 · ' + snap.positions.length + ' 笔' : '无信号（|评分| < ' + SIGNAL_THRESHOLD + '）'),
+      'fxq-advice' + (plan && plan.side < 0 ? ' sell' : ''));
+  }
+
+  function renderAccountPanel(snap) {
     setText(ui.equity, finite(snap.equity) ? money(snap.equity) : '—');
     setText(ui.cash, finite(snap.cash) ? money(snap.cash) : '—');
     const floating = snap.positions.reduce((s, p) => s + (finite(p.pnl) ? p.pnl : 0), 0);
     setText(ui.float, signedMoney(floating), floating >= 0 ? 'fxq-up' : 'fxq-down');
-
-    if (snap.positions.length) {
-      const worst = snap.positions.reduce((m, p) => {
-        if (!finite(p.margin) || p.margin <= 0) return m;
-        return Math.max(m, -p.pnl / p.margin);
-      }, 0);
-      setText(ui.dot, '', 'fxq-dot' + (worst >= RISK_WARN ? ' bad' : worst >= STOP_RATIO ? ' warn' : ''));
-      setText(ui.posline, snap.positions.map(p => {
-        const ratio = finite(p.margin) && p.margin > 0
-          ? ' (' + (p.pnl >= 0 ? '+' : '') + Math.round(p.pnl / p.margin * 100) + '%)'
-          : '';
-        return p.pair + (p.side === 1 ? '多' : '空') + ' ' + signedMoney(p.pnl || 0) + ratio;
-      }).join('   '));
-    } else {
+    if (!snap.positions.length) {
       setText(ui.dot, '', 'fxq-dot');
       setText(ui.posline, '无持仓');
+      return;
     }
+    const worst = snap.positions.reduce((m, p) => {
+      if (!finite(p.margin) || p.margin <= 0) return m;
+      return Math.max(m, -p.pnl / p.margin);
+    }, 0);
+    setText(ui.dot, '', 'fxq-dot' + (worst >= RISK_WARN ? ' bad' : worst >= STOP_RATIO ? ' warn' : ''));
+    setText(ui.posline, snap.positions.map(p => {
+      const ratio = finite(p.margin) && p.margin > 0
+        ? ' (' + (p.pnl >= 0 ? '+' : '') + Math.round(p.pnl / p.margin * 100) + '%)'
+        : '';
+      return p.pair + (p.side === 1 ? '多' : '空') + ' ' + signedMoney(p.pnl || 0) + ratio;
+    }).join('   '));
   }
 
   /* -------------------------------------------------------------- 主循环 */
@@ -1269,12 +1319,26 @@
     log('快进 ' + days + ' 个交易日（风控全程生效）');
   }
 
-  function step() {
-    const snap = snapshot();
-    currentSnap = snap;
-    recordSample(snap);
+  // 每轮只取一次快照；漂移模式下技术指标既不用于下单也不用于显示，整段跳过
+  function collectContext(snap) {
+    const ctx = { drift: [], driftByPair: new Map(), ranked: [], indMap: new Map(), best: null };
+    if (isDriftMode(snap.mode)) {
+      ctx.drift = driftSignals(snap, engine.tickAt);
+      for (const sig of ctx.drift) ctx.driftByPair.set(sig.pair, sig);
+      return ctx;
+    }
+    for (const pair of candidatesFor(snap)) {
+      const ind = cachedIndicators(getSeries(snap, pair), pair, snap.mode);
+      if (!ind) continue;
+      ctx.indMap.set(pair, ind);
+      ctx.ranked.push(ind);
+    }
+    ctx.best = ctx.ranked.reduce((best, ind) => !best || Math.abs(ind.score) > Math.abs(best.score) ? ind : best, null);
+    return ctx;
+  }
 
-    // 价格变化即视为一根新 bar；同时用于识别 riskPaused 造成的行情冻结
+  // 价格变化即视为一根新 bar；同时用于识别 riskPaused 造成的行情冻结
+  function trackTick(snap) {
     const priceNow = snap.prices['EUR/USD'];
     if (finite(priceNow) && priceNow !== engine.priceMemory.value) {
       engine.priceMemory.value = priceNow;
@@ -1283,42 +1347,28 @@
       engine.barCount++;
     }
     if (modalVisible() && Date.now() - engine.priceMemory.since > FREEZE_DETECT_MS) sweepModals();
+  }
 
+  function trackNews() {
     const newsNow = readNewsBias();
-    if (newsNow && (!engine.news || engine.news.title !== newsNow.title)) {
-      engine.news = { tag: newsNow.tag, title: newsNow.title, bias: newsNow.bias, at: Date.now() };
-      log('新闻「' + newsNow.tag + '」' + newsNow.title);
-    }
+    if (!newsNow) return;
+    if (engine.news && engine.news.title === newsNow.title) return;
+    engine.news = { tag: newsNow.tag, title: newsNow.title, bias: newsNow.bias, at: Date.now() };
+    log('新闻「' + newsNow.tag + '」' + newsNow.title);
+  }
 
-    const ctx = { drift: [], driftByPair: new Map(), ranked: [], indMap: new Map(), best: null };
-    for (const pair of candidatesFor(snap)) {
-      const ind = cachedIndicators(getSeries(snap, pair), pair, snap.mode);
-      if (!ind) continue;
-      ctx.indMap.set(pair, ind);
-      ctx.ranked.push(ind);
-    }
-    ctx.best = ctx.ranked.reduce((best, ind) => !best || Math.abs(ind.score) > Math.abs(best.score) ? ind : best, null);
-    if (isDriftMode(snap.mode)) {
-      ctx.drift = driftSignals(snap, engine.tickAt);
-      for (const sig of ctx.drift) ctx.driftByPair.set(sig.pair, sig);
-    }
+  function executePlan(plan) {
+    if (!plan || cfg.automation !== 'auto') return;
+    const now = Date.now();
+    if (now <= engine.suppressUntil || now - engine.lastActionAt <= ACTION_COOLDOWN_MS) return;
+    engine.lastActionAt = now;
+    if (!openTrade(plan.pair, plan.side, plan.margin, plan.leverage)) return;
+    engine.pending = null;
+    const opened = snapshot().positions.find(p => p.pair === plan.pair);
+    if (opened) registerExit(opened, plan);
+  }
 
-    manageRisk(snap, ctx);
-
-    const plan = decide(snap, ctx);
-    engine.pending = plan;
-
-    if (plan && cfg.automation === 'auto' && Date.now() > engine.suppressUntil && Date.now() - engine.lastActionAt > ACTION_COOLDOWN_MS) {
-      engine.lastActionAt = Date.now();
-      if (openTrade(plan.pair, plan.side, plan.margin, plan.leverage)) {
-        engine.pending = null;
-        const after = snapshot();
-        const opened = after.positions.find(p => p.pair === plan.pair);
-        if (opened) registerExit(opened, plan);
-      }
-    }
-
-    const playback = snap.mode === 'real' || snap.mode === 'battle';
+  function advancePlayback(snap) {
     if (fastForward.active) {
       if (fastForward.remaining > 0) {
         if (advanceDay()) fastForward.remaining--;
@@ -1327,10 +1377,27 @@
         fastForward.active = false;
         log('快进结束');
       }
-    } else if (playback && cfg.automation === 'auto' && Date.now() - engine.lastActionAt > DAY_ADVANCE_MS) {
+      return;
+    }
+    const playback = snap.mode === 'real' || snap.mode === 'battle';
+    if (playback && cfg.automation === 'auto' && Date.now() - engine.lastActionAt > DAY_ADVANCE_MS) {
       engine.lastActionAt = Date.now();
       advanceDay();
     }
+  }
+
+  function step() {
+    const snap = snapshot();
+    currentSnap = snap;
+    recordSample(snap);
+    trackTick(snap);
+    trackNews();
+
+    const ctx = collectContext(snap);
+    manageRisk(snap, ctx);
+    engine.pending = decide(snap, ctx);
+    executePlan(engine.pending);
+    advancePlayback(snap);
 
     if (modalVisible()) sweepModals();
     renderPanel(snap, ctx, engine.pending);
@@ -1342,7 +1409,7 @@
   installScriptBridge();
   PAGE.__FXQ__ = {
     BRIDGE, cfg, engine, snapshot, computeIndicators, getSeries, hasTool, logLines,
-    closeAllPositions, sweepModals, step, driftSum, bestDrift, driftSignals
+    closeAllPositions, sweepModals, step, driftSum, bestDrift, driftSignals, debugLog, collectContext
   };
 
   let bootWaits = 0;
@@ -1350,7 +1417,7 @@
     if (!PAGE.document.body) { setTimeout(boot, 60); return; }
     if (!$('longBtn')) { if (++bootWaits < 100) setTimeout(boot, 150); return; }
     buildUI();
-    log('量化辅助台已就绪 v1.2.0（漂移引擎 + 指标引擎）');
+    log('量化辅助台已就绪 v1.3.0（漂移引擎 + 指标引擎）');
     setInterval(() => {
       try { step(); } catch (err) { log('循环异常：' + (err && err.message ? err.message : err)); }
     }, LOOP_MS);
