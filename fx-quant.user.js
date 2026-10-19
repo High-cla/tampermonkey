@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FX 简单! · 量化辅助台
 // @namespace    https://www.bilibilitoy.com/toy/fx-simple
-// @version      1.3.0
-// @description  B站「FX 简单!」量化辅助：漂移相位引擎（白盒）+ 技术指标引擎（黑盒）+ 新闻偏置加权 + 三级自动化
+// @version      2.1.0
+// @description  B站「FX 简单!」量化辅助：八模块事件驱动架构、漂移相位引擎、移动端适配
 // @author       fxq
 // @match        https://www.bilibilitoy.com/toy/fx-simple/*
 // @run-at       document-start
@@ -10,27 +10,32 @@
 // ==/UserScript==
 
 /* ============================================================================
- * FX 简单! 量化辅助台
+ * FX 简单! 量化辅助台 v2.1.0
  *
- * 通道优先级（游戏 API > 框架 API > mod 实现）：
- *   1. 游戏 API —— 4 个 WebMCP 工具，execute 闭包直接持有内部 state
- *   2. 框架 API —— 游戏自己写入的 localStorage['fx-heartbeat-save-v3'].sim K 线
- *   3. mod 实现 —— DOM 读文本 / 点按钮；自拉 frankfurter；自采样价格
+ * 架构：一个总线实例 + 八个互不引用的模块（按单一职责切分）。
+ *   - 模块之间零直接调用，只经 bus.emit / bus.on 通信，事件名即契约（EV 常量）。
+ *   - 每个模块只暴露一个入口 init(bus)，返回 { dispose, debug }。
+ *   - 模块内部不出现其他模块的标识符；纯函数库无状态，可被任意模块使用。
  *
- * 双引擎（按模式分流）：
- *   漂移引擎（sim / challenge）—— tickSim 的漂移项可解析：
- *       drift = sin(Date.now()/13000 + index*2 + marketIndex*0.7) * 0.00036
- *     它是周期 ≈81.7s 的正弦波，单 tick 被噪声(σ=0.121%)盖住，但累积 10~27 tick
- *     后达 0.3~0.6%，而噪声只按 √n 长到 0.42% —— 实测方向命中率 74~80%。
- *     持有期动态取 argmax |driftSum|/√H（H∈[8,30]），到时无条件平仓。
- *   指标引擎（real / battle）—— 那两个模式没有 tickSim，用 EMA/MACD/RSI/布林 评分，
- *     并可选前瞻（真实历史序列已知，属作弊，默认关）。
+ * 模块职责：
+ *   bridge  双通道注入 + 工具句柄 + 存档读取
+ *   store   配置持久化 + 调试环
+ *   data    快照采集 + tick 计数 + 新闻识别 + 触发源（MutationObserver + 兜底定时）
+ *   series  序列获取（存档/采样/frankfurter）+ 指标缓存 + ctx 构建
+ *   engine  漂移/指标决策 + 风控退出 + 定量与敞口
+ *   exec    下单/平仓/推进日/弹窗白名单清扫/全平队列
+ *   input   Pointer 拖拽 + 断点检测 + 位置持久化 + 折叠状态
+ *   ui      面板 DOM + diff 渲染
  *
- * 游戏规则（由 app.js 反推，非猜测）：
- *   手续费   fee = margin * L * (0.00005 + L * 0.000005)，仅开仓收取
- *   爆仓线   riskRatio = -pnl/margin；>=0.6 弹窗并置 riskPaused=true（行情冻结），>=0.8 强平
- *   开仓约束 margin >= 10 且 margin + fee <= cash；挑战模式最多 5 仓且需 challenge.active
- *   弹窗语义 openModal() 里 modalCancel 的显隐 = 是否带 modalAction（会改账户状态）
+ * 事件链：bridge → data → series → engine → exec
+ *          input ──ui:state──→ ui；任一处失败经 log:add 汇到 ui。
+ *
+ * 静默降级策略（本文件所有空 catch 都属于以下预期情况，非预期错误走 log:add）：
+ *   - pageWorldPolyfill 内部：该函数被 toString 序列化注入页面主世界，不能引用外部标识符，
+ *     任何 try/catch 只能就地吞掉；失败由 bridge:blocked 事件上报。
+ *   - 存储不可用（隐私模式 / 配额满 / iframe 沙箱）：配置与位置不持久化，功能降级但不影响交易。
+ *   - 脏存档（手工改过 localStorage）：readSave 返回 null，调用方回落 DOM 通道。
+ *   - Pointer capture 失败（合成事件 / 旧内核）：拖拽退化为不跟手。
  * ==========================================================================*/
 
 (() => {
@@ -40,56 +45,127 @@
   if (PAGE.__FXQ_BOOTED__) return;
   PAGE.__FXQ_BOOTED__ = true;
 
-  /* ------------------------------------------------------------------ 常量 */
+  /* ================================================================ 常量 */
 
   const PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'EUR/CHF', 'AUD/USD', 'USD/CAD'];
   const DIGITS = { 'EUR/USD': 5, 'GBP/USD': 5, 'USD/JPY': 3, 'USD/CHF': 5, 'EUR/CHF': 5, 'AUD/USD': 5, 'USD/CAD': 5 };
-  const BATTLES = {
-    'franc-2015': { start: '2014-12-01', end: '2015-02-20' },
-    'brexit-2016': { start: '2016-05-16', end: '2016-07-22' },
-    'parity-2022': { start: '2022-06-01', end: '2022-08-12' },
-    'yen-2022': { start: '2022-08-15', end: '2022-10-28' }
-  };
   const FX_SYMBOLS = 'USD,GBP,JPY,CHF,AUD,CAD';
   const SAVE_KEY = 'fx-heartbeat-save-v3';
   const CFG_KEY = 'fxq-config-v1';
+  const POS_KEY = 'fxq-panel-pos';
+  const FOLD_KEY = 'fxq-fold';
 
-  // tickSim 的确定性结构（源码常量）
   const TICK_MS = 1500;
   const DRIFT_DIV = 13000;
   const DRIFT_AMP = 0.00036;
   const MARKET_PHASE = { sim: 0, challenge: 0.7 };
 
-  const LOOP_MS = 400;
+  const FALLBACK_MS = 500;
+  const BACKGROUND_MS = 2000;
   const SWEEP_MS = 1500;
   const SAMPLE_INTERVAL_MS = 1200;
   const SAMPLE_MAX = 400;
   const SAMPLE_MIN = 12;
   const SERIES_TTL_MS = 60000;
-  const FREEZE_DETECT_MS = 5000;
   const DAY_ADVANCE_MS = 800;
   const ACTION_COOLDOWN_MS = 2500;
   const ENTRY_COOLDOWN_MS = 15000;
   const SUPPRESS_MS = 8000;
   const NEWS_WINDOW_MS = 8000;
   const MAX_LOG = 40;
+  const REATTACH_MS = 3000;
 
   const MIN_MARGIN = 10;
   const STOP_RATIO = 0.40;
-  const STOP_MIN = 0.25;      // 弱漂移仓的止损
-  const STOP_MAX = 0.50;      // 强漂移仓的止损（游戏 0.6 会弹窗冻结行情，必须留边际）
-  const MAX_CCY_NOTIONAL_MULT = 5;  // 单一货币名义敞口上限 = 权益 × 该倍数
-  const MIN_POSITION_RATIO = 0.02;  // 缩仓后低于权益 2% 就不值得开（占位 + 手续费）
-  const KELLY_FRACTION = 0.5;       // 半凯利
+  const STOP_MIN = 0.25;
+  const STOP_MAX = 0.50;
+  const MAX_CCY_NOTIONAL_MULT = 5;
+  const MIN_POSITION_RATIO = 0.02;
+  const KELLY_FRACTION = 0.5;
   const KELLY_MIN_SAMPLE = 10;
+  const KELLY_DEFAULT = 0.12;
   const RISK_WARN = 0.60;
   const SIGNAL_THRESHOLD = 30;
+  const SIGNAL_STRONG = 55;
   const DRIFT_MIN_BARS = 8;
   const DRIFT_MAX_BARS = 30;
   const DRIFT_MIN_SUM = 0.0015;
+  const LOOKAHEAD_HORIZON = 3;
+  const LOOKAHEAD_SCALE = 0.004;
+  const LOOKAHEAD_BOOST = 0.3;     // 前瞻与指标同向时最多放大 30%
+  const LOOKAHEAD_CONFLICT = 0.4;  // 反向时把指标分数打到 40%，不反转方向
+  const LOOKAHEAD_SPAN_DAYS = 180; // 以游戏当前日期为中心前后各拉 180 天，cursor 必然能匹配
+  const LOOKAHEAD_MIN_NET = 0.0015; // 扣手续费后净空间不足 0.15% 不开仓
+  const MIN_BARS_FOR_SIGNAL = 30;
+  const MOBILE_BREAKPOINT = 720;
+  const RSI_OVERSOLD = 30;
+  const RSI_OVERBOUGHT = 70;
+  const IND = Object.freeze({
+    EMA_FAST: 12, EMA_SLOW: 26, MACD_SIGNAL: 9, MACD_WINDOW: 40,
+    RSI: 14, ATR: 14, BOLL: 20, BOLL_MULT: 2, ROC: 10
+  });
+  const SCORE_WEIGHTS = Object.freeze({ TREND: 30, MACD: 20, RSI: 20, BOLL: 15, ROC: 15 });
+
+  // 事件契约常量：唯一定义处，改这里等于改契约
+  const EV = Object.freeze({
+    LOG: 'log:add',
+    BRIDGE_READY: 'bridge:ready',
+    BRIDGE_BLOCKED: 'bridge:blocked',
+    CONFIG_SAVE: 'config:save',
+    CONFIG_CHANGED: 'config:changed',
+    DATA_REQUEST: 'data:request',
+    DATA_BAR: 'data:bar',
+    DATA_SNAPSHOT: 'data:snapshot',
+    NEWS_CHANGED: 'news:changed',
+    SERIES_READY: 'series:ready',
+    ENGINE_PLAN: 'engine:plan',
+    ENGINE_EXITS: 'engine:exits',
+    EXEC_OPENED: 'exec:opened',
+    EXEC_CLOSED: 'exec:closed',
+    UI_COMMAND: 'ui:command',
+    UI_SWEEP: 'ui:sweep',
+    UI_MOUNTED: 'ui:mounted',
+    UI_STATE: 'ui:state'
+  });
+  const STATUS = Object.freeze({ OK: 'ok', MISSING: 'missing', FAILED: 'failed' });
+  const MODE = Object.freeze({ OFF: 'off', CONFIRM: 'confirm', AUTO: 'auto' });
+  const SIZE_MODE = Object.freeze({ KELLY: 'kelly', FIXED: 'fixed' });
+
+  const DEFAULTS = Object.freeze({
+    automation: MODE.OFF,
+    leverage: 30,
+    riskPct: KELLY_DEFAULT,
+    takeProfitRatio: 0.9,
+    reverseExitScore: 30,
+    timeStopBars: 20,
+    allowLookahead: false,
+    maxPositions: 4,
+    sizeMode: SIZE_MODE.KELLY
+  });
+
+  const NEWS_BIAS = [
+    { tag: '通胀数据', title: '核心通胀高于预期', bias: { 'EUR/USD': -0.00045, 'GBP/USD': -0.00035, 'USD/JPY': 0.00038, 'USD/CHF': 0.0003, 'AUD/USD': -0.00042, 'USD/CAD': 0.00025 } },
+    { tag: '就业数据', title: '新增就业明显降温', bias: { 'EUR/USD': 0.00035, 'GBP/USD': 0.0003, 'USD/JPY': -0.00035, 'USD/CHF': -0.00025, 'AUD/USD': 0.00028, 'USD/CAD': -0.0002 } },
+    { tag: '风险事件', title: '避险情绪突然升温', bias: { 'EUR/USD': -0.00025, 'GBP/USD': -0.00032, 'USD/JPY': -0.00022, 'USD/CHF': -0.00018, 'AUD/USD': -0.0005, 'USD/CAD': 0.0003 } },
+    { tag: '央行讲话', title: '官员强调政策取决于数据', bias: {} },
+    { tag: '能源市场', title: '能源价格快速反弹', bias: { 'EUR/USD': -0.00028, 'GBP/USD': -0.00016, 'AUD/USD': 0.0002, 'USD/CAD': -0.00034 } },
+    { tag: '市场传闻', title: '大型资金调整月底仓位', bias: {} }
+  ];
+
+  /* ============================================================ 纯函数库 */
+
+  const $ = id => PAGE.document.getElementById(id);
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const finite = v => typeof v === 'number' && Number.isFinite(v);
+  const feeRate = lev => lev * (0.00005 + lev * 0.000005);
+  const MONEY_FMT = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const TIME_FMT = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  const money = n => (n < 0 ? '-$' : '$') + MONEY_FMT.format(Math.abs(n));
+  const signedMoney = n => (n >= 0 ? '+$' : '-$') + MONEY_FMT.format(Math.abs(n));
+  const priceText = (pair, v) => finite(v) ? v.toFixed(DIGITS[pair] || 5) : '—';
+  const isDriftMode = mode => mode === 'sim' || mode === 'challenge';
+
   const DRIFT_STEP = TICK_MS / DRIFT_DIV;
-  // 闭式解：Σ_{k=0..H-1} sin(θ+kΔ) = sin(HΔ/2)/sin(Δ/2) · sin(θ+(H-1)Δ/2)
-  // 再套和角公式，每品种每轮只需 2 次三角函数，其余全查表（原实现是 ΣH=437 次 sin/品种）
   const DRIFT_TABLES = (() => {
     const half = Math.sin(DRIFT_STEP / 2);
     const amp = [0], cosPhi = [0], sinPhi = [0], root = [0];
@@ -102,440 +178,13 @@
     }
     return { amp, cosPhi, sinPhi, root };
   })();
-  const LOOKAHEAD_HORIZON = 3;
-  const LOOKAHEAD_SCALE = 0.004;
-  const MIN_BARS_FOR_SIGNAL = 30;
 
-  // 新闻模板的方向性偏置（源码 SIM_NEWS 表；生效 5~8 tick，76% 概率与 bias 同向）
-  const NEWS_BIAS = [
-    { tag: '通胀数据', title: '核心通胀高于预期', bias: { 'EUR/USD': -0.00045, 'GBP/USD': -0.00035, 'USD/JPY': 0.00038, 'USD/CHF': 0.0003, 'AUD/USD': -0.00042, 'USD/CAD': 0.00025 } },
-    { tag: '就业数据', title: '新增就业明显降温', bias: { 'EUR/USD': 0.00035, 'GBP/USD': 0.0003, 'USD/JPY': -0.00035, 'USD/CHF': -0.00025, 'AUD/USD': 0.00028, 'USD/CAD': -0.0002 } },
-    { tag: '风险事件', title: '避险情绪突然升温', bias: { 'EUR/USD': -0.00025, 'GBP/USD': -0.00032, 'USD/JPY': -0.00022, 'USD/CHF': -0.00018, 'AUD/USD': -0.0005, 'USD/CAD': 0.0003 } },
-    { tag: '央行讲话', title: '官员强调政策取决于数据', bias: {} },
-    { tag: '能源市场', title: '能源价格快速反弹', bias: { 'EUR/USD': -0.00028, 'GBP/USD': -0.00016, 'AUD/USD': 0.0002, 'USD/CAD': -0.00034 } },
-    { tag: '市场传闻', title: '大型资金调整月底仓位', bias: {} }
-  ];
-
-  const DEFAULTS = Object.freeze({
-    automation: 'off',
-    leverage: 30,
-    riskPct: 0.12,
-    takeProfitRatio: 0.9,
-    reverseExitScore: 30,
-    timeStopBars: 20,
-    allowLookahead: false,
-    maxPositions: 4,
-    sizeMode: 'kelly'
-  });
-
-  /* -------------------------------------------------------------- 小工具 */
-
-  const $ = id => PAGE.document.getElementById(id);
-  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-  const finite = v => typeof v === 'number' && Number.isFinite(v);
-  const feeRate = lev => lev * (0.00005 + lev * 0.000005);
-  const MONEY_FMT = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const money = n => (n < 0 ? '-$' : '$') + MONEY_FMT.format(Math.abs(n));
-  const signedMoney = n => (n >= 0 ? '+$' : '-$') + MONEY_FMT.format(Math.abs(n));
-  const priceText = (pair, v) => finite(v) ? v.toFixed(DIGITS[pair] || 5) : '—';
-
-  function setText(node, text, cls) {
-    if (!node) return;
-    if (node.textContent !== text) node.textContent = text;
-    if (cls !== undefined && node.className !== cls) node.className = cls;
-  }
-
-  function setStyle(node, prop, value) {
-    if (!node) return;
-    if (node.style[prop] !== value) node.style[prop] = value;
-  }
-
-  function loadConfig() {
-    try {
-      const raw = PAGE.localStorage.getItem(CFG_KEY);
-      return raw ? Object.assign({}, DEFAULTS, JSON.parse(raw)) : Object.assign({}, DEFAULTS);
-    } catch (_) { return Object.assign({}, DEFAULTS); }
-  }
-  const cfg = loadConfig();
-  const saveConfig = () => {
-    try { PAGE.localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (_) {}   // 预期内：隐私模式/配额满，设置不持久化
-  };
-
-  const logLines = [];
-  let lastLogAt = 0, lastLogMsg = '';
-  function log(msg) {
-    const now = Date.now();
-    if (msg === lastLogMsg && now - lastLogAt < 4000) return;
-    lastLogAt = now; lastLogMsg = msg;
-    logLines.unshift(new Date().toLocaleTimeString('zh-CN', { hour12: false }) + '  ' + msg);
-    if (logLines.length > MAX_LOG) logLines.length = MAX_LOG;
-    if (ui.ready) ui.log.textContent = logLines.slice(0, 6).join('\n');
-  }
-
-  // 非预期异常的显性化出口：预期内的降级路径仍静默（见各处 catch 注释），
-  // 非预期的走这里留痕，面板可查，不再无声消失
-  const debugLog = [];
-  function safe(label, fn, fallback) {
-    try { return fn(); }
-    catch (err) {
-      if (debugLog.length >= 20) debugLog.shift();
-      debugLog.push(label + ': ' + (err && err.message ? err.message : String(err)));
-      return fallback;
-    }
-  }
-
-  /* ---------------------------------------------- 桥：页面内部 API 通道 */
-
-  const BRIDGE = { tools: Object.create(null), lastSave: '', via: 'none', hooked: false };
-
-  function pageWorldPolyfill(W) {
-    var SAVE = 'fx-heartbeat-save-v3';
-    var P = W.__FXQ_PAGE__ = W.__FXQ_PAGE__ || { tools: {}, lastSave: '' };
-    var d = W.document;
-    var prevReg = null;
-    try {
-      var prev = d.modelContext;
-      if (prev && typeof prev.registerTool === 'function') prevReg = prev.registerTool.bind(prev);
-    } catch (e) {}
-    var fake = {
-      registerTool: function (tool) {
-        try { if (tool && tool.name) P.tools[tool.name] = tool; } catch (e) {}
-        return prevReg ? prevReg(tool) : Promise.resolve(true);
-      }
-    };
-    try { Object.defineProperty(d, 'modelContext', { configurable: true, get: function () { return fake; } }); } catch (e) {}
-    try {
-      var proto = W.Storage && W.Storage.prototype;
-      if (proto && typeof proto.setItem === 'function' && !proto.__fxqHooked) {
-        var orig = proto.setItem;
-        proto.setItem = function (k, v) { if (k === SAVE) P.lastSave = String(v); return orig.apply(this, arguments); };
-        proto.__fxqHooked = true;
-      }
-    } catch (e) {}
-  }
-
-  function installScriptBridge() {
-    const doc = PAGE.document;
-    const inject = () => {
-      const host = doc.head || doc.documentElement;
-      if (!host) { setTimeout(inject, 20); return; }
-      try {
-        const node = doc.createElement('script');
-        node.textContent = '(' + pageWorldPolyfill.toString() + ')(window);';
-        host.appendChild(node);
-        node.remove();
-      } catch (err) {
-        // 预期内降级：CSP 禁止内联脚本时走 unsafeWindow 直挂通道，但留痕便于排查
-        log('主世界注入被阻断，改用直挂通道：' + (err && err.message ? err.message : err));
-      }
-    };
-    inject();
-  }
-
-  function installDirectBridge() {
-    const doc = PAGE.document;
-    const capture = mc => {
-      BRIDGE.hooked = true;
-      try {
-        const orig = mc.registerTool;
-        mc.registerTool = function (tool) {
-          try { if (tool && tool.name) BRIDGE.tools[tool.name] = tool; } catch (_) {}
-          return typeof orig === 'function' ? orig.apply(mc, arguments) : Promise.resolve(true);
-        };
-      } catch (_) {}
-    };
-
-    try {
-      const native = doc.modelContext;
-      if (native && typeof native.registerTool === 'function') capture(native);
-    } catch (_) {}
-
-    if (!BRIDGE.hooked) {
-      const fake = {
-        registerTool(tool) {
-          try { if (tool && tool.name) BRIDGE.tools[tool.name] = tool; } catch (_) {}
-          BRIDGE.hooked = true;
-          return Promise.resolve(true);
-        }
-      };
-      let ok = false;
-      try {
-        Object.defineProperty(doc, 'modelContext', { configurable: true, get: () => fake });
-        ok = doc.modelContext === fake;
-      } catch (_) {}
-      if (!ok) { try { doc.modelContext = fake; ok = doc.modelContext === fake; } catch (_) {} }
-    }
-
-    try {
-      const proto = PAGE.Storage && PAGE.Storage.prototype;
-      if (proto && typeof proto.setItem === 'function') {
-        const origSet = proto.setItem;
-        proto.setItem = function (key, value) {
-          if (key === SAVE_KEY) BRIDGE.lastSave = String(value);
-          return origSet.apply(this, arguments);
-        };
-      }
-    } catch (_) {}
-
-    try { BRIDGE.lastSave = PAGE.localStorage.getItem(SAVE_KEY) || ''; } catch (_) {}   // 预期内：存储被禁则只走 API 通道
-  }
-
-  const TOOL_OK = 0, TOOL_MISSING = 1, TOOL_FAILED = 2;
-
-  function pageTools() {
-    try { return (PAGE.__FXQ_PAGE__ && PAGE.__FXQ_PAGE__.tools) || null; } catch (_) { return null; }
-  }
-
-  function toolFor(name) {
-    const local = BRIDGE.tools[name];
-    if (local && typeof local.execute === 'function') return local;
-    const remote = pageTools();
-    const other = remote && remote[name];
-    return other && typeof other.execute === 'function' ? other : null;
-  }
-
-  function callTool(name, args) {
-    const tool = toolFor(name);
-    if (!tool) return { status: TOOL_MISSING };
-    try {
-      return { status: TOOL_OK, value: tool.execute(args || {}) };
-    } catch (err) {
-      return { status: TOOL_FAILED, error: err };
-    }
-  }
-
-  const hasTool = name => !!toolFor(name);
-
-  /* --------------------------------------------------------- 快照：账户态 */
-
-  const sampled = new Map();
-  let lastSampleAt = 0;
-
-  let saveCache = { raw: null, data: null };
-
-  function readSave() {
-    try {
-      let raw = BRIDGE.lastSave;
-      if (!raw) raw = (PAGE.__FXQ_PAGE__ && PAGE.__FXQ_PAGE__.lastSave) || '';
-      if (!raw) raw = PAGE.localStorage.getItem(SAVE_KEY);
-      // 引用相等即短路：游戏每 1.5s 才换新字符串，7 个品种的查询共享一次解析
-      if (raw === saveCache.raw) return saveCache.data;
-      const data = raw ? JSON.parse(raw) : null;
-      saveCache = { raw, data };
-      return data;
-    } catch (_) { return null; }   // 脏存档属预期：返回 null 由调用方降级
-  }
-
-  function readDomMoney(id) {
-    const node = $(id);
-    if (!node) return NaN;
-    const n = Number(String(node.textContent).replace(/[^0-9.\-]/g, ''));
-    return Number.isFinite(n) ? n : NaN;
-  }
-
-  function currentPairFromDom() {
-    const node = $('pairTitle');
-    const title = node ? String(node.textContent).replace(/\s+/g, '') : '';
-    return PAIRS.includes(title) ? title : 'EUR/USD';
-  }
-
-  function domSnapshot() {
-    const activeMode = ['simMode', 'realMode', 'battleMode', 'challengeMode']
-      .map(id => $(id)).find(btn => btn && btn.classList.contains('active'));
-    const mode = activeMode ? activeMode.id.replace('Mode', '') : 'sim';
-    const pair = currentPairFromDom();
-    const price = Number(String(($('currentPrice') || {}).textContent || '').replace(/[^0-9.]/g, ''));
-
-    const positions = [];
-    PAGE.document.querySelectorAll('#positions .position-row').forEach((row, index) => {
-      const head = row.querySelector('.pos-name strong');
-      const headText = head ? String(head.textContent) : '';
-      const pairHit = PAIRS.find(p => headText.indexOf(p) === 0);
-      const cells = row.querySelectorAll('.pos-cell strong');
-      const pnlText = cells[2] ? String(cells[2].textContent).trim() : '';
-      positions.push({
-        id: 'dom-' + index,
-        pair: pairHit || pair,
-        side: headText.indexOf('做多') >= 0 ? 1 : -1,
-        margin: NaN,
-        leverage: cfg.leverage,
-        entry: cells[0] ? Number(String(cells[0].textContent).replace(/[^0-9.]/g, '')) : NaN,
-        pnl: Number(pnlText.replace(/[^0-9.]/g, '')) * (pnlText.charAt(0) === '-' ? -1 : 1)
-      });
-    });
-
-    return {
-      mode, battleId: null, challenge: null, date: null,
-      cash: readDomMoney('cash'), debt: readDomMoney('debt'), equity: readDomMoney('equity'),
-      prices: finite(price) ? { [pair]: price } : {},
-      positions, via: 'dom'
-    };
-  }
-
-  function snapshot() {
-    const res = callTool('read_fx_game_state');
-    if (res.status === TOOL_OK && res.value && res.value.prices) {
-      const api = res.value;
-      BRIDGE.via = 'api';
-      return {
-        mode: api.mode,
-        battleId: api.battleId,
-        challenge: api.challenge,
-        date: api.date,
-        cash: api.cash,
-        debt: api.debt,
-        equity: api.equity,
-        prices: api.prices,
-        positions: (api.positions || []).map(p => ({
-          id: p.id, pair: p.pair, side: p.side === 'long' ? 1 : -1,
-          margin: p.margin, leverage: p.leverage, entry: p.entry, pnl: p.pnl
-        })),
-        via: 'api'
-      };
-    }
-    BRIDGE.via = 'dom';
-    return domSnapshot();
-  }
-
-  /* ------------------------------------------------- 序列：K 线与价格路径 */
-
-  function parseFrankfurter(data) {
-    return Object.entries(data.rates || {}).sort(([a], [b]) => a.localeCompare(b)).map(([date, r]) => {
-      if (!['USD', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD'].every(k => Number.isFinite(r[k]) && r[k] > 0)) return null;
-      return {
-        date,
-        prices: {
-          'EUR/USD': r.USD,
-          'GBP/USD': r.USD / r.GBP,
-          'USD/JPY': r.JPY / r.USD,
-          'USD/CHF': r.CHF / r.USD,
-          'EUR/CHF': r.CHF,
-          'AUD/USD': r.USD / r.AUD,
-          'USD/CAD': r.CAD / r.USD
-        }
-      };
-    }).filter(Boolean);
-  }
-
-  const historyCache = new Map();
-
-  async function fetchHistory(start, end) {
-    const key = start + '~' + end;
-    if (historyCache.has(key)) return historyCache.get(key);
-    const url = 'https://api.frankfurter.dev/v1/' + start + '..' + end + '?base=EUR&symbols=' + FX_SYMBOLS;
-    const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const items = parseFrankfurter(await res.json());
-    if (items.length < 5) throw new Error('历史数据不足');
-    historyCache.set(key, items);
-    return items;
-  }
-
-  function domRange() {
-    const s = $('rangeStart') ? $('rangeStart').value : '';
-    const e = $('rangeEnd') ? $('rangeEnd').value : '';
-    if (/^\d{4}-\d{2}-\d{2}$/.test(s) && /^\d{4}-\d{2}-\d{2}$/.test(e)) return { start: s, end: e };
-    const end = new Date();
-    const start = new Date();
-    start.setUTCDate(start.getUTCDate() - 364);
-    return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
-  }
-
-  function candlesFromPrices(prices) {
-    return prices.map((c, i) => {
-      const prev = i ? prices[i - 1] : c;
-      return { o: prev, h: Math.max(prev, c), l: Math.min(prev, c), c };
-    });
-  }
-
-  function simSeries(pair) {
-    const save = readSave();
-    const node = save && save.sim && save.sim[pair];
-    if (!node || !Array.isArray(node.candles) || node.candles.length < 10) return null;
-    const candles = node.candles.map(k => ({ o: k.open, h: k.high, l: k.low, c: k.close }));
-    return { candles, prices: candles.map(k => k.c), source: '游戏存档K线 ' + candles.length + ' 根', future: null, cursor: -1 };
-  }
-
-  function sampledSeries(pair) {
-    const buf = sampled.get(pair);
-    if (!buf || buf.length < SAMPLE_MIN) return null;
-    const prices = buf.map(p => p.c);
-    return { candles: candlesFromPrices(prices), prices, source: '实时采样 ' + prices.length + ' 点', future: null, cursor: -1 };
-  }
-
-  function recordSample(snap) {
-    const now = Date.now();
-    if (now - lastSampleAt < SAMPLE_INTERVAL_MS) return;
-    lastSampleAt = now;
-    for (const pair of PAIRS) {
-      const price = snap.prices[pair];
-      if (!finite(price) || price <= 0) continue;
-      let buf = sampled.get(pair);
-      if (!buf) { buf = []; sampled.set(pair, buf); }
-      const last = buf.at(-1);
-      if (last && Math.abs(last.c - price) < 1e-12) continue;
-      buf.push({ t: now, c: price });
-      if (buf.length > SAMPLE_MAX) buf.shift();
-    }
-  }
-
-  async function fetchPlaybackSeries(snap, pair) {
-    let range = null;
-    if (snap.mode === 'battle') range = BATTLES[snap.battleId] || null;
-    else if (snap.mode === 'real') range = domRange();
-    if (!range) return null;
-
-    let items;
-    try { items = await fetchHistory(range.start, range.end); }
-    catch (err) { log('历史序列拉取失败：' + (err && err.message ? err.message : err)); return null; }
-
-    // parseFrankfurter 已保证每行 6 币种齐全；这里不做 filter，否则会与 dates 下标错位
-    const prices = items.map(row => row.prices[pair]);
-    if (prices.length < 10) return null;
-    const cursor = snap.date ? items.findIndex(row => row.date === snap.date) : -1;
-    return {
-      candles: candlesFromPrices(prices),
-      prices,
-      dates: items.map(row => row.date),
-      cursor,
-      source: 'frankfurter ' + range.start + '→' + range.end,
-      future: cursor >= 0 ? prices.slice(cursor + 1) : null
-    };
-  }
-
-  const seriesCache = new Map();
-
-  function getSeries(snap, pair) {
-    if (snap.mode === 'sim') return simSeries(pair);
-    // 挑战模式行情由 challengeSim 驱动且不存档，只能用游戏 API 的价格采样；
-    // 采样不足宁可不发信号，也不拿模拟市场 K 线顶替（无关序列）
-    if (snap.mode === 'challenge') return sampledSeries(pair);
-
-    const key = snap.mode + '|' + (snap.battleId || '') + '|' + pair;
-    const entry = seriesCache.get(key);
-    if (entry && Date.now() - entry.at < SERIES_TTL_MS) return entry.data;
-    if (!entry || !entry.busy) {
-      const record = { busy: true, data: entry ? entry.data : null, at: entry ? entry.at : 0 };
-      seriesCache.set(key, record);
-      fetchPlaybackSeries(snap, pair)
-        .then(data => { record.data = data; record.at = Date.now(); })
-        .catch(() => { record.data = null; })
-        .finally(() => { record.busy = false; });
-    }
-    return entry ? entry.data : null;
-  }
-
-  /* ------------------------------------------- 漂移引擎：解析 tickSim 的确定性项 */
-
-  // Σ_{k=0..H-1} sin((t0 + k*TICK)/DIV + idx*2 + phase) * AMP
   function driftSum(t0, index, horizon, marketPhase) {
     if (horizon < 1 || horizon > DRIFT_MAX_BARS) return 0;
     const theta0 = t0 / DRIFT_DIV + index * 2 + marketPhase;
-    const phi = (horizon - 1) * DRIFT_STEP / 2;
-    return DRIFT_TABLES.amp[horizon] * Math.sin(theta0 + phi);
+    return DRIFT_TABLES.amp[horizon] * Math.sin(theta0 + (horizon - 1) * DRIFT_STEP / 2);
   }
 
-  // 最优持有期：最大化 漂移累积 / 噪声(∝√H)，即信噪比
   function bestDrift(t0, index, marketPhase) {
     const theta0 = t0 / DRIFT_DIV + index * 2 + marketPhase;
     const s = Math.sin(theta0), c = Math.cos(theta0);
@@ -548,8 +197,8 @@
     return best;
   }
 
-  function driftSignals(snap, t0) {
-    const marketPhase = MARKET_PHASE[snap.mode] ?? 0;
+  function driftSignalsFor(mode, t0) {
+    const marketPhase = MARKET_PHASE[mode] ?? 0;
     const out = [];
     PAIRS.forEach((pair, index) => {
       const best = bestDrift(t0, index, marketPhase);
@@ -558,23 +207,6 @@
     });
     return out.sort((a, b) => b.ratio - a.ratio);
   }
-
-  function readNewsBias() {
-    const node = $('tickerTrack');
-    if (!node) return null;
-    const text = String(node.textContent);
-    const hit = NEWS_BIAS.find(item => text.indexOf('【' + item.tag + '】' + item.title) >= 0);
-    return hit || null;
-  }
-
-  function activeNewsBias() {
-    const news = engine.news;
-    if (!news) return null;
-    if (Date.now() - news.at > NEWS_WINDOW_MS) return null;
-    return news;
-  }
-
-  /* ------------------------------------------------------------ 指标计算 */
 
   function emaSeries(values, period) {
     const k = 2 / (period + 1);
@@ -626,30 +258,30 @@
     if (!series || !series.prices || series.prices.length < MIN_BARS_FOR_SIGNAL) return null;
     const prices = series.prices;
     const last = prices.at(-1);
-    const ema12 = emaSeries(prices, 12);
-    const ema26 = emaSeries(prices, 26);
+    const ema12 = emaSeries(prices, IND.EMA_FAST);
+    const ema26 = emaSeries(prices, IND.EMA_SLOW);
     const e12 = ema12.at(-1);
     const e26 = ema26.at(-1);
     const macdLine = ema12.map((v, i) => v - ema26[i]);
-    const macdSignal = emaSeries(macdLine.slice(-40), 9);
+    const macdSignal = emaSeries(macdLine.slice(-IND.MACD_WINDOW), IND.MACD_SIGNAL);
     const macdHist = macdLine.at(-1) - macdSignal.at(-1);
-    const rsi14 = rsiLast(prices, 14);
-    const atr14 = atrOf(series.candles, 14);
-    const boll = bollinger(prices, 20, 2);
-    const roc10 = prices.length > 10 ? (last / prices[prices.length - 11] - 1) : 0;
+    const rsi14 = rsiLast(prices, IND.RSI);
+    const atr14 = atrOf(series.candles, IND.ATR);
+    const boll = bollinger(prices, IND.BOLL, IND.BOLL_MULT);
+    const roc10 = prices.length > IND.ROC ? (last / prices[prices.length - (IND.ROC + 1)] - 1) : 0;
     const atrPct = atr14 && last ? atr14 / last : 0;
     const bollPos = boll && boll.upper > boll.lower ? (last - boll.lower) / (boll.upper - boll.lower) : 0.5;
 
     const trend = atr14 ? clamp((e12 - e26) / (atr14 * 0.6), -1, 1) : 0;
     const macdNorm = atr14 ? clamp(macdHist / (atr14 * 0.5), -1, 1) : 0;
     const rsiScore = rsi14 === null ? 0
-      : rsi14 < 30 ? clamp((30 - rsi14) / 30, 0, 1)
-        : rsi14 > 70 ? -clamp((rsi14 - 70) / 30, 0, 1)
+      : rsi14 < RSI_OVERSOLD ? clamp((RSI_OVERSOLD - rsi14) / RSI_OVERSOLD, 0, 1)
+        : rsi14 > RSI_OVERBOUGHT ? -clamp((rsi14 - RSI_OVERBOUGHT) / (100 - RSI_OVERBOUGHT), 0, 1)
           : (50 - rsi14) / 50 * 0.35;
     const bollScore = clamp((bollPos - 0.5) * 2, -1, 1);
     const rocNorm = atrPct > 0 ? clamp(roc10 / (atrPct * 3), -1, 1) : 0;
-
-    const score = clamp(trend * 30 + macdNorm * 20 + rsiScore * 20 + bollScore * 15 + rocNorm * 15, -100, 100);
+    const w = SCORE_WEIGHTS;
+    const score = clamp(trend * w.TREND + macdNorm * w.MACD + rsiScore * w.RSI + bollScore * w.BOLL + rocNorm * w.ROC, -100, 100);
     return {
       pair, price: last, score,
       ema12: e12, ema26: e26, macdHist, rsi14, atr14, atrPct, boll, bollPos, roc10,
@@ -657,22 +289,24 @@
     };
   }
 
-  const indCache = new Map();
-
-  function fingerprint(series) {
-    const n = series.prices.length;
-    return n + '|' + series.prices[n - 1] + '|' + (series.cursor ?? -1);
+  function parseFrankfurter(data) {
+    return Object.entries(data.rates || {}).sort(([a], [b]) => a.localeCompare(b)).map(([date, r]) => {
+      if (!['USD', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD'].every(k => Number.isFinite(r[k]) && r[k] > 0)) return null;
+      return {
+        date,
+        prices: {
+          'EUR/USD': r.USD, 'GBP/USD': r.USD / r.GBP, 'USD/JPY': r.JPY / r.USD,
+          'USD/CHF': r.CHF / r.USD, 'EUR/CHF': r.CHF, 'AUD/USD': r.USD / r.AUD, 'USD/CAD': r.CAD / r.USD
+        }
+      };
+    }).filter(Boolean);
   }
 
-  function cachedIndicators(series, pair, mode) {
-    if (!series) return null;
-    const key = mode + '|' + pair;
-    const fp = fingerprint(series);
-    const hit = indCache.get(key);
-    if (hit && hit.fp === fp) return hit.ind;
-    const ind = computeIndicators(series, pair);
-    indCache.set(key, { fp, ind });
-    return ind;
+  function candlesFromPrices(prices) {
+    return prices.map((c, i) => {
+      const prev = i ? prices[i - 1] : c;
+      return { o: prev, h: Math.max(prev, c), l: Math.min(prev, c), c };
+    });
   }
 
   function lookaheadBias(series) {
@@ -684,167 +318,9 @@
     return then / now - 1;
   }
 
-  /* ---------------------------------------------------------------- 执行层 */
-
-  function setField(id, value) {
-    const node = $(id);
-    if (!node) return false;
-    node.value = String(value);
-    node.dispatchEvent(new PAGE.Event('input', { bubbles: true }));
-    node.dispatchEvent(new PAGE.Event('change', { bubbles: true }));
-    return true;
-  }
-
-  function openTrade(pair, side, margin, leverage) {
-    const res = callTool('place_fx_trade', { pair, side: side === 1 ? 'long' : 'short', margin, leverage });
-    if (res.status === TOOL_OK) {
-      log('开仓 ' + pair + (side === 1 ? ' 做多' : ' 做空') + ' 保证金 ' + money(margin) + ' @' + leverage + 'x');
-      return true;
-    }
-    if (res.status === TOOL_FAILED) {
-      log('开仓被拒：' + (res.error && res.error.message ? res.error.message : String(res.error)));
-      return false;
-    }
-    setField('leverageRange', leverage);
-    setField('marginInput', margin);
-    for (const row of PAGE.document.querySelectorAll('#pairList .pair-row')) {
-      if (String(row.textContent).indexOf(pair) === 0) { row.click(); break; }
-    }
-    const btn = $(side === 1 ? 'longBtn' : 'shortBtn');
-    if (!btn) { log('找不到下单按钮'); return false; }
-    btn.click();
-    log('开仓(DOM) ' + pair + (side === 1 ? ' 做多' : ' 做空') + ' 保证金 ' + money(margin));
-    return true;
-  }
-
-  function domCloseRow(position) {
-    const rows = Array.from(PAGE.document.querySelectorAll('#positions .position-row'));
-    if (!rows.length) return null;
-    const pair = position.pair || '';
-    const sideText = position.side === 1 ? '做多' : '做空';
-    return rows.find(row => {
-      const text = String(row.textContent);
-      return text.indexOf(pair) >= 0 && text.indexOf(sideText) >= 0;
-    }) || null;
-  }
-
-  function closeTrade(position, reason) {
-    if (!position) return false;
-    const res = callTool('close_fx_trade', { id: position.id });
-    if (res.status === TOOL_OK) {
-      log('平仓 ' + position.pair + (reason ? '(' + reason + ')' : '') + ' 盈亏 ' + signedMoney(position.pnl || 0));
-      engine.pairCooldown.set(position.pair, { at: Date.now(), side: position.side });
-      return true;
-    }
-    if (res.status === TOOL_FAILED) {
-      log('平仓被拒：' + (res.error && res.error.message ? res.error.message : String(res.error)));
-      return false;
-    }
-    const row = domCloseRow(position);
-    const btn = row && row.querySelector('button');
-    if (!btn) return false;
-    btn.click();
-    log('平仓(DOM) ' + position.pair + (reason ? '(' + reason + ')' : ''));
-    engine.pairCooldown.set(position.pair, { at: Date.now(), side: position.side });
-    return true;
-  }
-
-  // 逐笔平仓并重新取快照：平掉一笔后其余持仓下标会位移
-  function closeAllPositions() {
-    engine.suppressUntil = Date.now() + SUPPRESS_MS;
-    let closed = 0;
-    for (let guard = 0; guard < 20; guard++) {
-      const snap = snapshot();
-      if (!snap.positions.length) break;
-      const before = snap.positions.length;
-      if (!closeTrade(snap.positions[0], '全平')) break;
-      closed++;
-      if (snapshot().positions.length >= before) break;
-    }
-    return closed;
-  }
-
-  function advanceDay() {
-    const res = callTool('advance_real_fx_day');
-    if (res.status === TOOL_OK) return true;
-    const btn = $('nextDayBtn');
-    if (btn && !btn.classList.contains('hidden')) { btn.click(); return true; }
-    return false;
-  }
-
-  function modalVisible() {
-    const modal = $('modal');
-    return !!modal && !modal.classList.contains('hidden');
-  }
-
-  // 只清理「无 modalAction」的弹窗：modalCancel 的显隐是 openModal 里 action 有无的镜像
-  function sweepModals() {
-    if (!modalVisible()) return false;
-    const cancel = $('modalCancel');
-    if (cancel && !cancel.classList.contains('hidden')) return false;
-    const confirm = $('modalConfirm');
-    if (!confirm) return false;
-    confirm.click();
-    return true;
-  }
-
-  /* ---------------------------------------------------------------- 决策层 */
-
-  const engine = {
-    lastActionAt: 0,
-    pending: null,
-    barCount: 0,
-    entryBars: new Map(),
-    exitBars: new Map(),
-    stopRatio: new Map(),
-    pairCooldown: new Map(),
-    suppressUntil: 0,
-    news: null,
-    tickAt: Date.now(),
-    priceMemory: { value: null, since: Date.now() }
-  };
-
-  const maxAffordable = (cash, leverage) => Math.max(0, Math.floor((cash / (1 + feeRate(leverage))) * 100) / 100);
-  const isDriftMode = mode => mode === 'sim' || mode === 'challenge';
-
-  function candidatesFor(snap) {
-    if (isDriftMode(snap.mode)) return PAIRS;
-    const set = new Set([currentPairFromDom()]);
-    snap.positions.forEach(p => set.add(p.pair));
-    return [...set];
-  }
-
-  function guardNewPosition(snap, pair, side) {
-    if (snap.positions.some(p => p.pair === pair)) return false;
-    if (snap.positions.length >= cfg.maxPositions) return false;
-    if (snap.mode === 'challenge' && snap.challenge && !snap.challenge.active) return false;
-    if (snap.mode === 'challenge' && snap.positions.length >= 5) return false;
-    const cooled = engine.pairCooldown.get(pair);
-    // 同向重进要等冷却；反向（反手）放行，否则反手会被自己的冷却挡住
-    return !(cooled && Date.now() - cooled.at < ENTRY_COOLDOWN_MS && cooled.side === side);
-  }
-
-  // 半凯利：用游戏自己的平仓记录在线估计 p 与赔率 b，样本不足时回落到保守默认
-  function kellyFraction(mode) {
-    if (cfg.sizeMode !== 'kelly') return cfg.riskPct;
-    const save = readSave();
-    const hist = save && save.accounts && save.accounts[mode] && save.accounts[mode].history;
-    const settled = Array.isArray(hist) ? hist.filter(h => !h.liquidated) : [];
-    if (settled.length < KELLY_MIN_SAMPLE) return 0.12;
-    const wins = settled.filter(h => h.pnl > 0);
-    const losses = settled.filter(h => h.pnl <= 0);
-    const p = wins.length / settled.length;
-    const avgWin = wins.length ? wins.reduce((a, h) => a + h.pnl, 0) / wins.length : 1;
-    const avgLoss = losses.length ? Math.abs(losses.reduce((a, h) => a + h.pnl, 0) / losses.length) : 1;
-    const b = avgLoss > 0 ? avgWin / avgLoss : 1;
-    const f = p - (1 - p) / b;
-    return clamp(f * KELLY_FRACTION, 0.08, 0.25);
-  }
-
-  // 单一货币名义敞口（EUR/USD 做多 = +EUR −USD）
-  function currencyNotional(snap) {
+  function currencyNotional(positions) {
     const map = new Map();
-    for (const pos of snap.positions) {
+    for (const pos of positions) {
       const [base, quote] = String(pos.pair).split('/');
       if (!base || !quote) continue;
       const notional = finite(pos.margin) && finite(pos.leverage) ? pos.margin * pos.leverage : 0;
@@ -855,188 +331,1192 @@
     return map;
   }
 
-  // 相关性去重：新仓若把某个货币的净敞口推过上限，就按比例缩仓
-  function exposureScale(snap, pair, side, margin, leverage) {
-    const [base, quote] = String(pair).split('/');
-    if (!base || !quote) return 1;
-    const map = currencyNotional(snap);
-    const cap = (finite(snap.equity) ? snap.equity : snap.cash) * MAX_CCY_NOTIONAL_MULT;
-    const notional = margin * leverage;
-    let scale = 1;
-    for (const [ccy, delta] of [[base, notional * side], [quote, -notional * side]]) {
-      const cur = map.get(ccy) || 0;
-      const next = cur + delta;
-      if (Math.abs(next) <= cap) continue;
-      // 只有同向叠加才会超限；异号是抵消，不用缩
-      if (cur === 0 || Math.sign(cur) !== Math.sign(delta)) continue;
-      const allowed = Math.max(0, cap - Math.abs(cur));
-      if (Math.abs(delta) > 0) scale = Math.min(scale, allowed / Math.abs(delta));
+  // 纯函数：给定 history 与 cfg 求半凯利比例（调用方负责按引用记忆化）
+  function kellyFraction(history, cfg) {
+    if (cfg.sizeMode !== SIZE_MODE.KELLY) return cfg.riskPct;
+    const settled = Array.isArray(history) ? history.filter(h => !h.liquidated) : [];
+    if (settled.length < KELLY_MIN_SAMPLE) return KELLY_DEFAULT;
+    const wins = settled.filter(h => h.pnl > 0);
+    const losses = settled.filter(h => h.pnl <= 0);
+    const p = wins.length / settled.length;
+    const avgWin = wins.length ? wins.reduce((a, h) => a + h.pnl, 0) / wins.length : 1;
+    const avgLoss = losses.length ? Math.abs(losses.reduce((a, h) => a + h.pnl, 0) / losses.length) : 1;
+    const b = avgLoss > 0 ? avgWin / avgLoss : 1;
+    return clamp((p - (1 - p) / b) * KELLY_FRACTION, 0.08, 0.25);
+  }
+
+  /* ================================================================ 总线 */
+
+  function createBus() {
+    const handlers = new Map();
+    let depth = 0;
+    let dropped = 0;
+
+    const on = (name, fn) => {
+      let set = handlers.get(name);
+      if (!set) { set = new Set(); handlers.set(name, set); }
+      set.add(fn);
+      return () => set.delete(fn);
+    };
+
+    const off = (name, fn) => {
+      const set = handlers.get(name);
+      if (set) set.delete(fn);
+    };
+
+    const emit = (name, payload) => {
+      if (depth > 8) { dropped++; return; }
+      const set = handlers.get(name);
+      if (!set || !set.size) return;
+      depth++;
+      try {
+        for (const fn of [...set]) {
+          try { fn(payload); }
+          catch (err) {
+            if (name !== EV.LOG) emit(EV.LOG, { msg: '[' + name + '] ' + (err?.message ? err.message : String(err)) });
+          }
+        }
+      } finally { depth--; }
+    };
+
+    return { on, off, emit, stats: () => ({ names: handlers.size, dropped }) };
+  }
+
+  /* ======================================================= 模块 1：bridge */
+
+  function createBridge(bus) {
+    const tools = Object.create(null);
+    let lastSave = '';
+    let via = 'none';
+    let hooked = false;
+
+    function pageWorldPolyfill(W) {
+      var SAVE = 'fx-heartbeat-save-v3';
+      var P = W.__FXQ_PAGE__ = W.__FXQ_PAGE__ || { tools: {}, lastSave: '' };
+      var d = W.document;
+      var prevReg = null;
+      try {
+        var prev = d.modelContext;
+        if (prev && typeof prev.registerTool === 'function') prevReg = prev.registerTool.bind(prev);
+      } catch {}
+      var fake = {
+        registerTool: function (tool) {
+          try { if (tool?.name) P.tools[tool.name] = tool; } catch {}
+          return prevReg ? prevReg(tool) : Promise.resolve(true);
+        }
+      };
+      try { Object.defineProperty(d, 'modelContext', { configurable: true, get: function () { return fake; } }); } catch {}
+      try {
+        var proto = W.Storage && W.Storage.prototype;
+        if (proto && typeof proto.setItem === 'function' && !proto.__fxqHooked) {
+          var orig = proto.setItem;
+          proto.setItem = function (k, v) { if (k === SAVE) P.lastSave = String(v); return orig.apply(this, arguments); };
+          proto.__fxqHooked = true;
+        }
+      } catch {}
     }
-    return clamp(scale, 0, 1);
-  }
 
-  function sizePosition(snap, strength, weight) {
-    const equity = finite(snap.equity) ? snap.equity : snap.cash;
-    const margin = Math.min(
-      Math.max(MIN_MARGIN, Math.round(equity * kellyFraction(snap.mode) * strength * weight)),
-      maxAffordable(snap.cash, cfg.leverage)
-    );
-    return margin >= MIN_MARGIN ? margin : 0;
-  }
-
-  // 漂移引擎：按信噪比排序，取第一个可开仓的品种；新闻偏置做方向加权
-  function planDrift(snap, signals) {
-    const news = activeNewsBias();
-    for (const sig of signals) {
-      if (!guardNewPosition(snap, sig.pair, sig.side)) continue;
-      let weight = 1;
-      let note = ' · 漂移' + (sig.value * 100).toFixed(2) + '%/' + sig.horizon + 't';
-      if (news && news.bias[sig.pair]) {
-        const aligned = Math.sign(news.bias[sig.pair]) === sig.side;
-        weight = aligned ? 1.3 : 0.6;
-        note += aligned ? ' · 新闻顺风' : ' · 新闻逆风';
-      }
-      const strength = clamp(Math.abs(sig.value) / (DRIFT_MIN_SUM * 3), 0.5, 1);
-      let margin = sizePosition(snap, strength, weight);
-      if (!margin) continue;
-      const scale = exposureScale(snap, sig.pair, sig.side, margin, cfg.leverage);
-      if (scale < 1) {
-        margin = Math.floor(margin * scale);
-        const floor = Math.max(MIN_MARGIN, Math.round((finite(snap.equity) ? snap.equity : snap.cash) * MIN_POSITION_RATIO));
-        if (margin < floor) continue;   // 敞口压缩后仓位过小，静默放弃（属常态，不刷日志）
-        note += ' · 敞口' + Math.round(scale * 100) + '%';
-      }
-      // 漂移越强，可容忍的回撤越大（上限 50%，游戏 60% 会弹窗冻结行情）
-      const stopRatio = clamp(0.25 + Math.abs(sig.value) / DRIFT_MIN_SUM * 0.05, STOP_MIN, STOP_MAX);
-      return { pair: sig.pair, side: sig.side, margin, leverage: cfg.leverage, horizon: sig.horizon, score: sig.value * 10000, stopRatio, note };
+    function installScriptBridge() {
+      const doc = PAGE.document;
+      const inject = () => {
+        const host = doc.head || doc.documentElement;
+        if (!host) { setTimeout(inject, 20); return; }
+        try {
+          const node = doc.createElement('script');
+          node.textContent = '(' + pageWorldPolyfill.toString() + ')(window);';
+          host.appendChild(node);
+          node.remove();
+        } catch (err) {
+          bus.emit(EV.BRIDGE_BLOCKED, { reason: err?.message ? err.message : String(err) });
+        }
+      };
+      inject();
     }
-    return null;
+
+    function installDirectBridge() {
+      const doc = PAGE.document;
+      const capture = mc => {
+        hooked = true;
+        try {
+          const orig = mc.registerTool;
+          mc.registerTool = function (tool) {
+            try { if (tool?.name) tools[tool.name] = tool; } catch {}
+            return typeof orig === 'function' ? orig.apply(mc, arguments) : Promise.resolve(true);
+          };
+        } catch {}
+      };
+
+      try {
+        const native = doc.modelContext;
+        if (native && typeof native.registerTool === 'function') capture(native);
+      } catch {}
+
+      if (!hooked) {
+        const fake = {
+          registerTool(tool) {
+            try { if (tool?.name) tools[tool.name] = tool; } catch {}
+            hooked = true;
+            return Promise.resolve(true);
+          }
+        };
+        let ok = false;
+        try {
+          Object.defineProperty(doc, 'modelContext', { configurable: true, get: () => fake });
+          ok = doc.modelContext === fake;
+        } catch {}
+        if (!ok) { try { doc.modelContext = fake; ok = doc.modelContext === fake; } catch {} }
+      }
+
+      try {
+        const proto = PAGE.Storage && PAGE.Storage.prototype;
+        if (proto && typeof proto.setItem === 'function') {
+          const origSet = proto.setItem;
+          proto.setItem = function (key, value) {
+            if (key === SAVE_KEY) lastSave = String(value);
+            return origSet.apply(this, arguments);
+          };
+        }
+      } catch {}
+
+      try { lastSave = PAGE.localStorage.getItem(SAVE_KEY) || ''; } catch {}
+    }
+
+    const pageTools = () => PAGE.__FXQ_PAGE__?.tools || null;
+
+    function toolFor(name) {
+      const local = tools[name];
+      if (local && typeof local.execute === 'function') return local;
+      const other = pageTools()?.[name];
+      return other && typeof other.execute === 'function' ? other : null;
+    }
+
+    const has = name => !!toolFor(name);
+
+    const call = (name, args) => {
+      const tool = toolFor(name);
+      if (!tool) return { status: STATUS.MISSING };
+      try {
+        return { status: STATUS.OK, value: tool.execute(args || {}) };
+      } catch (err) {
+        return { status: STATUS.FAILED, error: err };
+      }
+    };
+
+    const readSave = (() => {
+      let cachedRaw = null, cachedData = null;
+      return () => {
+        let raw = lastSave || PAGE.__FXQ_PAGE__?.lastSave || '';
+        if (!raw) { try { raw = PAGE.localStorage.getItem(SAVE_KEY) || ''; } catch {} }
+        if (raw === cachedRaw) return cachedData;
+        try { cachedData = raw ? JSON.parse(raw) : null; } catch { cachedData = null; }
+        cachedRaw = raw;
+        return cachedData;
+      };
+    })();
+
+    function init() {
+      installDirectBridge();
+      installScriptBridge();
+      const announce = () => {
+        via = Object.keys(tools).length || Object.keys(pageTools() || {}).length ? 'api' : 'dom';
+        bus.emit(EV.BRIDGE_READY, { via, call, has, readSave });
+      };
+      if (PAGE.document.readyState === 'complete') setTimeout(announce, 0);
+      else PAGE.addEventListener('load', announce, { once: true });
+      setTimeout(announce, REATTACH_MS);
+      return {
+        dispose() {},
+        debug: {
+          get tools() { return tools; },
+          setTools(next) { for (const k of Object.keys(tools)) delete tools[k]; if (next) Object.assign(tools, next); },
+          call, has, readSave,
+          get via() { return via; }
+        }
+      };
+    }
+
+    return { init };
   }
 
-  // 指标引擎（real / battle）
-  function planIndicator(snap, ranked) {
-    const order = ranked.slice().sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
-    for (const ind of order) {
-      let score = ind.score;
-      let note = '';
-      if (cfg.allowLookahead) {
-        const bias = lookaheadBias(getSeries(snap, ind.pair));
-        if (bias !== null) {
-          score = clamp(score * 0.25 + clamp(bias / LOOKAHEAD_SCALE, -1, 1) * 75, -100, 100);
-          note = ' · 前瞻' + (bias >= 0 ? '+' : '') + (bias * 100).toFixed(2) + '%';
+  /* ======================================================== 模块 2：store */
+
+  function createStore(bus) {
+    let cfg = Object.assign({}, DEFAULTS);
+    const debugLog = [];
+
+    function init() {
+      try {
+        const raw = PAGE.localStorage.getItem(CFG_KEY);
+        if (raw) cfg = Object.assign({}, DEFAULTS, JSON.parse(raw));
+      } catch {}
+      bus.on(EV.CONFIG_SAVE, ({ patch }) => {
+        cfg = Object.assign({}, cfg, patch || {});
+        try { PAGE.localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch {}
+        bus.emit(EV.CONFIG_CHANGED, { cfg });
+      });
+      bus.on(EV.LOG, ({ msg }) => {
+        if (debugLog.length >= 20) debugLog.shift();
+        debugLog.push(msg);
+      });
+      bus.emit(EV.CONFIG_CHANGED, { cfg });
+      return { dispose() {}, debug: { get cfg() { return cfg; }, debugLog } };
+    }
+
+    return { init };
+  }
+
+  /* ========================================================= 模块 3：data */
+
+  function createData(bus) {
+    const state = {
+      bridge: null,
+      cfg: Object.assign({}, DEFAULTS),
+      snap: { mode: 'sim', positions: [], prices: {}, cash: 0, equity: 0 },
+      lastPrice: null,
+      tickAt: Date.now(),
+      barCount: 0,
+      news: null,
+      newsCache: { text: null, hit: null }
+    };
+
+    const readDomMoney = id => {
+      const node = $(id);
+      if (!node) return NaN;
+      const n = Number(String(node.textContent).replace(/[^0-9.\-]/g, ''));
+      return Number.isFinite(n) ? n : NaN;
+    };
+
+    function currentPairFromDom() {
+      const title = $('pairTitle') ? String($('pairTitle').textContent).replace(/\s+/g, '') : '';
+      return PAIRS.includes(title) ? title : PAIRS[0];
+    }
+
+    function domSnapshot() {
+      const activeMode = ['simMode', 'realMode', 'battleMode', 'challengeMode']
+        .map(id => $(id)).find(btn => btn?.classList.contains('active'));
+      const mode = activeMode ? activeMode.id.replace('Mode', '') : 'sim';
+      const pair = currentPairFromDom();
+      const price = Number(String($('currentPrice')?.textContent || '').replace(/[^0-9.]/g, ''));
+      const positions = [];
+      PAGE.document.querySelectorAll('#positions .position-row').forEach((row, index) => {
+        const headText = row.querySelector('.pos-name strong') ? String(row.querySelector('.pos-name strong').textContent) : '';
+        const pairHit = PAIRS.find(p => headText.indexOf(p) === 0);
+        const cells = row.querySelectorAll('.pos-cell strong');
+        const pnlText = cells[2] ? String(cells[2].textContent).trim() : '';
+        positions.push({
+          id: 'dom-' + index,
+          pair: pairHit || pair,
+          side: headText.indexOf('做多') >= 0 ? 1 : -1,
+          margin: NaN,
+          leverage: state.cfg.leverage,
+          entry: cells[0] ? Number(String(cells[0].textContent).replace(/[^0-9.]/g, '')) : NaN,
+          pnl: Number(pnlText.replace(/[^0-9.]/g, '')) * (pnlText.charAt(0) === '-' ? -1 : 1)
+        });
+      });
+      return {
+        mode, battleId: null, challenge: null, date: null,
+        cash: readDomMoney('cash'), debt: readDomMoney('debt'), equity: readDomMoney('equity'),
+        prices: finite(price) ? { [pair]: price } : {},
+        positions, via: 'dom'
+      };
+    }
+
+    function snapshot() {
+      const res = state.bridge ? state.bridge.call('read_fx_game_state') : null;
+      if (res?.status === STATUS.OK && res.value?.prices) {
+        const api = res.value;
+        return {
+          mode: api.mode, battleId: api.battleId, challenge: api.challenge, date: api.date,
+          cash: api.cash, debt: api.debt, equity: api.equity, prices: api.prices,
+          positions: (api.positions || []).map(p => ({
+            id: p.id, pair: p.pair, side: p.side === 'long' ? 1 : -1,
+            margin: p.margin, leverage: p.leverage, entry: p.entry, pnl: p.pnl
+          })),
+          via: 'api'
+        };
+      }
+      return domSnapshot();
+    }
+
+    // 文本未变则不重新匹配（跑马灯整条文本 60~120 字，6 次 indexOf）
+    function readNewsBias() {
+      const node = $('tickerTrack');
+      if (!node) return null;
+      const text = String(node.textContent);
+      if (text === state.newsCache.text) return state.newsCache.hit;
+      const hit = NEWS_BIAS.find(item => text.indexOf('【' + item.tag + '】' + item.title) >= 0) || null;
+      state.newsCache = { text, hit };
+      return hit;
+    }
+
+    function collect() {
+      const snap = snapshot();
+      state.snap = snap;
+
+      const priceNow = snap.prices[PAIRS[0]];
+      if (finite(priceNow) && priceNow !== state.lastPrice) {
+        state.lastPrice = priceNow;
+        state.tickAt = Date.now();
+        state.barCount++;
+        bus.emit(EV.DATA_BAR, { at: state.tickAt, count: state.barCount });
+      }
+
+      const newsNow = readNewsBias();
+      if (newsNow && state.news?.title !== newsNow.title) {
+        state.news = { tag: newsNow.tag, title: newsNow.title, bias: newsNow.bias, at: Date.now() };
+        bus.emit(EV.NEWS_CHANGED, { news: state.news });
+      }
+
+      bus.emit(EV.DATA_SNAPSHOT, { snap });
+    }
+
+    // 触发源：MutationObserver 对齐游戏 render；递归 setTimeout 兜底，间隔随页面可见性调整
+    function watch() {
+      const targets = ['#pairTitle', '#currentPrice', '#positions', '#equity', '#cash'];
+      const seen = new Set();
+      const mo = new MutationObserver(() => { collect(); });
+      const attach = () => {
+        for (const sel of targets) {
+          const node = PAGE.document.querySelector(sel);
+          if (!node || seen.has(node)) continue;
+          seen.add(node);
+          mo.observe(node, { childList: true, subtree: true, characterData: true });
+        }
+      };
+      attach();
+      const reattach = setInterval(attach, REATTACH_MS);
+      const sweep = setInterval(() => bus.emit(EV.UI_SWEEP), SWEEP_MS);
+      let stopped = false;
+      let fallbackTimer = null;
+      const schedule = () => {
+        if (stopped) return;
+        fallbackTimer = setTimeout(() => { collect(); schedule(); }, PAGE.document.hidden ? BACKGROUND_MS : FALLBACK_MS);
+      };
+      schedule();
+      const onVisibility = () => { if (!PAGE.document.hidden) collect(); };
+      PAGE.document.addEventListener('visibilitychange', onVisibility);
+      return () => {
+        stopped = true;
+        mo.disconnect();
+        clearInterval(reattach);
+        clearInterval(sweep);
+        clearTimeout(fallbackTimer);
+        PAGE.document.removeEventListener('visibilitychange', onVisibility);
+      };
+    }
+
+    function init() {
+      let stopWatch = null;
+      bus.on(EV.BRIDGE_READY, bridge => {
+        state.bridge = bridge;
+        if (!stopWatch) stopWatch = watch();
+        collect();
+      });
+      bus.on(EV.CONFIG_CHANGED, ({ cfg }) => { state.cfg = cfg; });
+      bus.on(EV.DATA_REQUEST, collect);
+      return {
+        dispose() { if (stopWatch) stopWatch(); },
+        debug: { snapshot, collect, state }
+      };
+    }
+
+    return { init };
+  }
+
+  /* ======================================================= 模块 4：series */
+
+  function createSeries(bus) {
+    const state = {
+      bridge: null,
+      cfg: Object.assign({}, DEFAULTS),
+      sampled: new Map(),
+      lastSampleAt: 0,
+      historyCache: new Map(),
+      seriesCache: new Map(),
+      indCache: new Map(),
+      tickAt: Date.now()
+    };
+
+    const log = msg => bus.emit(EV.LOG, { msg });
+
+    function historyFor(mode) {
+      const save = state.bridge?.readSave();
+      const node = save?.accounts?.[mode];
+      return node && Array.isArray(node.history) ? node.history : [];
+    }
+
+    function simSeries(pair) {
+      const node = state.bridge?.readSave()?.sim?.[pair];
+      if (!node || !Array.isArray(node.candles) || node.candles.length < 10) return null;
+      const candles = node.candles.map(k => ({ o: k.open, h: k.high, l: k.low, c: k.close }));
+      return { candles, prices: candles.map(k => k.c), source: '游戏存档K线 ' + candles.length + ' 根', future: null, cursor: -1 };
+    }
+
+    function sampledSeries(pair) {
+      const buf = state.sampled.get(pair);
+      if (!buf || buf.length < SAMPLE_MIN) return null;
+      const prices = buf.map(p => p.c);
+      return { candles: candlesFromPrices(prices), prices, source: '实时采样 ' + prices.length + ' 点', future: null, cursor: -1 };
+    }
+
+    function recordSample(snap) {
+      const now = Date.now();
+      if (now - state.lastSampleAt < SAMPLE_INTERVAL_MS) return;
+      state.lastSampleAt = now;
+      for (const pair of PAIRS) {
+        const price = snap.prices[pair];
+        if (!finite(price) || price <= 0) continue;
+        let buf = state.sampled.get(pair);
+        if (!buf) { buf = []; state.sampled.set(pair, buf); }
+        const last = buf.at(-1);
+        if (last && Math.abs(last.c - price) < 1e-12) continue;
+        buf.push({ t: now, c: price });
+        if (buf.length > SAMPLE_MAX) buf.shift();
+      }
+    }
+
+    function rangeAround(dateStr, days) {
+      const d = new Date(dateStr + 'T00:00:00Z');
+      const start = new Date(d);
+      const end = new Date(d);
+      start.setUTCDate(start.getUTCDate() - days);
+      end.setUTCDate(end.getUTCDate() + days);
+      return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
+    }
+
+    async function fetchHistory(start, end) {
+      const key = start + '~' + end;
+      if (state.historyCache.has(key)) return state.historyCache.get(key);
+      const url = 'https://api.frankfurter.dev/v1/' + start + '..' + end + '?base=EUR&symbols=' + FX_SYMBOLS;
+      const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const items = parseFrankfurter(await res.json());
+      if (items.length < 5) throw new Error('历史数据不足');
+      state.historyCache.set(key, items);
+      return items;
+    }
+
+    async function fetchPlaybackSeries(snap, pair) {
+      if (!snap.date) return null;
+      const range = rangeAround(snap.date, LOOKAHEAD_SPAN_DAYS);
+      let items;
+      try { items = await fetchHistory(range.start, range.end); }
+      catch (err) { log('历史序列拉取失败：' + (err?.message ? err.message : err)); return null; }
+      const prices = items.map(row => row.prices[pair]);
+      if (prices.length < 10) return null;
+      const dates = items.map(row => row.date);
+      const cursor = dates.indexOf(snap.date);
+      return {
+        candles: candlesFromPrices(prices), prices, dates, cursor,
+        source: 'frankfurter ±' + LOOKAHEAD_SPAN_DAYS + 'd',
+        future: cursor >= 0 ? prices.slice(cursor + 1) : null
+      };
+    }
+
+    // 日期前进时只换 cursor，不重拉（±180 天内复用同一份 items）
+    function reindex(series, date) {
+      if (!date) return series;
+      if (series.cursor >= 0 && series.dates[series.cursor] === date) return series;
+      const cursor = series.dates.indexOf(date);
+      return { ...series, cursor, future: cursor >= 0 ? series.prices.slice(cursor + 1) : null };
+    }
+
+    function getSeries(snap, pair) {
+      if (snap.mode === 'sim') return simSeries(pair);
+      if (snap.mode === 'challenge') return sampledSeries(pair);
+      const key = snap.mode + '|' + (snap.battleId || '') + '|' + pair;
+      const entry = state.seriesCache.get(key);
+      if (entry && entry.data && Date.now() - entry.at < SERIES_TTL_MS) return reindex(entry.data, snap.date);
+      if (!entry || !entry.busy) {
+        const record = { busy: true, data: entry ? entry.data : null, at: entry ? entry.at : 0 };
+        state.seriesCache.set(key, record);
+        fetchPlaybackSeries(snap, pair)
+          .then(data => { record.data = data; record.at = Date.now(); })
+          .catch(() => { record.data = null; })
+          .finally(() => { record.busy = false; });
+      }
+      return entry && entry.data ? reindex(entry.data, snap.date) : null;
+    }
+
+    // 三元组比较替代字符串键，省掉每轮 7 次字符串拼接
+    function cachedIndicators(series, pair, mode) {
+      if (!series) return null;
+      const n = series.prices.length;
+      const last = series.prices[n - 1];
+      const cursor = series.cursor ?? -1;
+      const key = mode + '|' + pair;
+      const hit = state.indCache.get(key);
+      if (hit && hit.n === n && hit.last === last && hit.cursor === cursor) return hit.ind;
+      const ind = computeIndicators(series, pair);
+      state.indCache.set(key, { n, last, cursor, ind });
+      return ind;
+    }
+
+    function candidatesFor(snap) {
+      if (isDriftMode(snap.mode)) return PAIRS;
+      const set = new Set([currentPairFromDom()]);
+      snap.positions.forEach(p => set.add(p.pair));
+      return [...set];
+    }
+
+    function currentPairFromDom() {
+      const title = $('pairTitle') ? String($('pairTitle').textContent).replace(/\s+/g, '') : '';
+      return PAIRS.includes(title) ? title : PAIRS[0];
+    }
+
+    // drift 模式下技术指标既不下单也不显示，整段跳过
+    function buildContext(snap) {
+      const ctx = { drift: [], driftByPair: new Map(), ranked: [], indMap: new Map(), best: null, history: [], getSeries: null };
+      ctx.getSeries = pair => getSeries(snap, pair);
+      if (isDriftMode(snap.mode)) {
+        ctx.drift = driftSignalsFor(snap.mode, state.tickAt);
+        for (const sig of ctx.drift) ctx.driftByPair.set(sig.pair, sig);
+        ctx.history = historyFor(snap.mode);
+        return ctx;
+      }
+      for (const pair of candidatesFor(snap)) {
+        const ind = cachedIndicators(getSeries(snap, pair), pair, snap.mode);
+        if (!ind) continue;
+        ctx.indMap.set(pair, ind);
+        ctx.ranked.push(ind);
+      }
+      ctx.best = ctx.ranked.reduce((best, ind) => !best || Math.abs(ind.score) > Math.abs(best.score) ? ind : best, null);
+      ctx.history = historyFor(snap.mode);
+      return ctx;
+    }
+
+    function onSnapshot({ snap }) {
+      recordSample(snap);
+      bus.emit(EV.SERIES_READY, { snap, ctx: buildContext(snap) });
+    }
+
+    function init() {
+      bus.on(EV.BRIDGE_READY, bridge => { state.bridge = bridge; });
+      bus.on(EV.CONFIG_CHANGED, ({ cfg }) => { state.cfg = cfg; });
+      bus.on(EV.DATA_BAR, ({ at }) => { state.tickAt = at; });
+      bus.on(EV.DATA_SNAPSHOT, onSnapshot);
+      return {
+        dispose() {},
+        debug: { getSeries, buildContext, state, historyFor }
+      };
+    }
+
+    return { init };
+  }
+
+  /* ======================================================= 模块 5：engine */
+
+  function createEngine(bus) {
+    const state = {
+      cfg: Object.assign({}, DEFAULTS),
+      barCount: 0,
+      tickAt: Date.now(),
+      entryBars: new Map(),
+      exitBars: new Map(),
+      stopRatio: new Map(),
+      pairCooldown: new Map(),
+      lastActionAt: 0,
+      suppressUntil: 0,
+      news: null,
+      pending: null,
+      kellyCache: { history: null, sizeMode: null, riskPct: null, value: KELLY_DEFAULT }
+    };
+
+    const maxAffordable = (cash, leverage) => Math.max(0, Math.floor((cash / (1 + feeRate(leverage))) * 100) / 100);
+
+    // history 引用未变则不重算（每轮 sizePosition 会调 1~7 次）
+    function kellyFor(history, cfg) {
+      const c = state.kellyCache;
+      if (c.history === history && c.sizeMode === cfg.sizeMode && c.riskPct === cfg.riskPct) return c.value;
+      const value = kellyFraction(history, cfg);
+      state.kellyCache = { history, sizeMode: cfg.sizeMode, riskPct: cfg.riskPct, value };
+      return value;
+    }
+
+    function guardNewPosition(snap, pair, side) {
+      if (snap.positions.some(p => p.pair === pair)) return false;
+      if (snap.positions.length >= state.cfg.maxPositions) return false;
+      if (snap.mode === 'challenge' && snap.challenge && !snap.challenge.active) return false;
+      if (snap.mode === 'challenge' && snap.positions.length >= 5) return false;
+      const cooled = state.pairCooldown.get(pair);
+      return !(cooled && Date.now() - cooled.at < ENTRY_COOLDOWN_MS && cooled.side === side);
+    }
+
+    function sizePosition(snap, ctx, strength, weight) {
+      const equity = finite(snap.equity) ? snap.equity : snap.cash;
+      const margin = Math.min(
+        Math.max(MIN_MARGIN, Math.round(equity * kellyFor(ctx.history, state.cfg) * strength * weight)),
+        maxAffordable(snap.cash, state.cfg.leverage)
+      );
+      return margin >= MIN_MARGIN ? margin : 0;
+    }
+
+    function exposureScale(snap, pair, side, margin, leverage) {
+      const [base, quote] = String(pair).split('/');
+      if (!base || !quote) return 1;
+      const map = currencyNotional(snap.positions);
+      const cap = (finite(snap.equity) ? snap.equity : snap.cash) * MAX_CCY_NOTIONAL_MULT;
+      const notional = margin * leverage;
+      let scale = 1;
+      for (const [ccy, delta] of [[base, notional * side], [quote, -notional * side]]) {
+        const cur = map.get(ccy) || 0;
+        if (Math.abs(cur + delta) <= cap) continue;
+        if (cur === 0 || Math.sign(cur) !== Math.sign(delta)) continue;
+        const allowed = Math.max(0, cap - Math.abs(cur));
+        if (Math.abs(delta) > 0) scale = Math.min(scale, allowed / Math.abs(delta));
+      }
+      return clamp(scale, 0, 1);
+    }
+
+    function activeNewsBias() {
+      if (!state.news) return null;
+      return Date.now() - state.news.at > NEWS_WINDOW_MS ? null : state.news;
+    }
+
+    function planDrift(snap, ctx) {
+      const news = activeNewsBias();
+      for (const sig of ctx.drift) {
+        if (!guardNewPosition(snap, sig.pair, sig.side)) continue;
+        let weight = 1;
+        let note = ' · 漂移' + (sig.value * 100).toFixed(2) + '%/' + sig.horizon + 't';
+        if (news?.bias[sig.pair]) {
+          const aligned = Math.sign(news.bias[sig.pair]) === sig.side;
+          weight = aligned ? 1.3 : 0.6;
+          note += aligned ? ' · 新闻顺风' : ' · 新闻逆风';
+        }
+        const strength = clamp(Math.abs(sig.value) / (DRIFT_MIN_SUM * 3), 0.5, 1);
+        let margin = sizePosition(snap, ctx, strength, weight);
+        if (!margin) continue;
+        const scale = exposureScale(snap, sig.pair, sig.side, margin, state.cfg.leverage);
+        if (scale < 1) {
+          margin = Math.floor(margin * scale);
+          const floor = Math.max(MIN_MARGIN, Math.round((finite(snap.equity) ? snap.equity : snap.cash) * MIN_POSITION_RATIO));
+          if (margin < floor) continue;
+          note += ' · 敞口' + Math.round(scale * 100) + '%';
+        }
+        const stopRatio = clamp(0.25 + Math.abs(sig.value) / DRIFT_MIN_SUM * 0.05, STOP_MIN, STOP_MAX);
+        return { pair: sig.pair, side: sig.side, margin, leverage: state.cfg.leverage, horizon: sig.horizon, score: sig.value * 10000, stopRatio, note };
+      }
+      return null;
+    }
+
+    // 前瞻只做方向确认：同向放大、反向削弱，不替换指标方向。
+    // 关键：开仓与平仓必须用同一个分数，否则「前瞻开多、指标喊跌」会立刻触发反转平仓，反复摩擦。
+    function prepareFused(ctx) {
+      ctx.fused = new Map();
+      if (!state.cfg.allowLookahead) return;
+      for (const ind of ctx.ranked) {
+        const bias = lookaheadBias(ctx.getSeries(ind.pair));
+        if (bias === null) continue;
+        const dir = clamp(bias / LOOKAHEAD_SCALE, -1, 1);
+        const same = dir * ind.score >= 0;
+        const factor = same ? 1 + LOOKAHEAD_BOOST * Math.abs(dir) : LOOKAHEAD_CONFLICT;
+        ctx.fused.set(ind.pair, { score: clamp(ind.score * factor, -100, 100), bias, dir, same });
+      }
+    }
+
+    // 前瞻引擎：real/battle 的价格就是 frankfurter 历史，future 是真实未来价（实测 ratio 1.000000）。
+    // 扣掉手续费后仍有净空间才开仓，持有 LOOKAHEAD_HORIZON 个交易日后无条件平。
+    function planLookahead(snap, ctx) {
+      if (!state.cfg.allowLookahead) return null;
+      const pairs = snap.mode === 'battle' && snap.pair ? [snap.pair] : PAIRS;
+      let best = null;
+      for (const pair of pairs) {
+        const series = ctx.getSeries(pair);
+        if (!series || series.cursor < 0 || !series.future || series.future.length < LOOKAHEAD_HORIZON) continue;
+        const now = series.prices[series.cursor];
+        const then = series.future[LOOKAHEAD_HORIZON - 1];
+        if (!finite(now) || !finite(then) || now <= 0) continue;
+        const bias = then / now - 1;
+        const fee = 0.00005 + state.cfg.leverage * 0.000005;
+        const net = Math.abs(bias) - fee;
+        if (net < LOOKAHEAD_MIN_NET) continue;
+        if (!best || net > best.net) best = { pair, bias, net };
+      }
+      if (!best) return null;
+      const side = best.bias > 0 ? 1 : -1;
+      if (!guardNewPosition(snap, best.pair, side)) return null;
+      const margin = sizePosition(snap, ctx, clamp(best.net / LOOKAHEAD_SCALE, 0.4, 1), 1);
+      if (!margin) return null;
+      return {
+        pair: best.pair, side, margin, leverage: state.cfg.leverage,
+        score: best.bias * 10000, stopRatio: STOP_RATIO,
+        note: ' · 前瞻' + (best.bias >= 0 ? '+' : '') + (best.bias * 100).toFixed(2) + '% · 净' + (best.net * 100).toFixed(2) + '%',
+        horizon: LOOKAHEAD_HORIZON
+      };
+    }
+
+    function planIndicator(snap, ctx) {
+      const order = ctx.ranked.toSorted((a, b) => Math.abs(b.score) - Math.abs(a.score));
+      for (const ind of order) {
+        const fused = ctx.fused?.get(ind.pair) || null;
+        const score = fused ? fused.score : ind.score;
+        const note = fused ? ' · 前瞻' + (fused.bias >= 0 ? '+' : '') + (fused.bias * 100).toFixed(2) + '%' : '';
+        if (Math.abs(score) < SIGNAL_THRESHOLD) continue;
+        const side = score > 0 ? 1 : -1;
+        if (!guardNewPosition(snap, ind.pair, side)) continue;
+        const margin = sizePosition(snap, ctx, clamp(Math.abs(score) / 100, 0.4, 1), 1);
+        if (!margin) continue;
+        return { pair: ind.pair, side, margin, leverage: state.cfg.leverage, score, stopRatio: STOP_RATIO, note, horizon: fused ? LOOKAHEAD_HORIZON : undefined };
+      }
+      return null;
+    }
+
+    function computeExits(snap, ctx) {
+      const exits = [];
+      const driftMode = isDriftMode(snap.mode);
+      for (const pos of snap.positions) {
+        if (!state.entryBars.has(pos.id)) state.entryBars.set(pos.id, state.barCount);
+        if (!finite(pos.margin) || pos.margin <= 0) continue;
+        const lossRatio = -pos.pnl / pos.margin;
+        const stop = state.stopRatio.get(pos.id) ?? STOP_RATIO;
+        if (lossRatio >= stop) { exits.push({ position: pos, reason: '止损' }); continue; }
+        // 到期平仓对两种引擎都生效：前瞻只看 LOOKAHEAD_HORIZON 天，到期必须走，否则利润回吐
+        const exitAt = state.exitBars.get(pos.id);
+        if (exitAt != null && state.barCount >= exitAt) { exits.push({ position: pos, reason: '到期' }); continue; }
+        if (driftMode) {
+          const sig = ctx.driftByPair.get(pos.pair);
+          if (sig && sig.side !== pos.side) { exits.push({ position: pos, reason: '反手' }); continue; }
+          continue;
+        }
+        if (pos.pnl > 0 && pos.pnl / pos.margin >= state.cfg.takeProfitRatio) { exits.push({ position: pos, reason: '止盈' }); continue; }
+        const ind = ctx.indMap.get(pos.pair);
+        if (ind && exitAt == null) {   // 前瞻仓到期前不看指标，否则真先知会被滞后指标砍掉
+          const ref = (ctx.fused?.get(pos.pair) || ind).score;
+          const against = pos.side === 1 ? ref <= -state.cfg.reverseExitScore : ref >= state.cfg.reverseExitScore;
+          if (against) { exits.push({ position: pos, reason: '反转' }); continue; }
+        }
+        if (state.barCount - state.entryBars.get(pos.id) >= state.cfg.timeStopBars && pos.pnl <= 0) {
+          exits.push({ position: pos, reason: '时间止损' });
         }
       }
-      if (Math.abs(score) < SIGNAL_THRESHOLD) continue;
-      const side = score > 0 ? 1 : -1;
-      if (!guardNewPosition(snap, ind.pair, side)) continue;
-      const margin = sizePosition(snap, clamp(Math.abs(score) / 100, 0.4, 1), 1);
-      if (!margin) continue;
-      return { pair: ind.pair, side, margin, leverage: cfg.leverage, score, stopRatio: STOP_RATIO, note };
-    }
-    return null;
-  }
-
-  function decide(snap, ctx) {
-    return isDriftMode(snap.mode) ? planDrift(snap, ctx.drift) : planIndicator(snap, ctx.ranked);
-  }
-
-  function manageRisk(snap, ctx) {
-    const driftMode = isDriftMode(snap.mode);
-    for (const pos of snap.positions) {
-      if (!engine.entryBars.has(pos.id)) engine.entryBars.set(pos.id, engine.barCount);
-      if (!finite(pos.margin) || pos.margin <= 0) continue;
-
-      const lossRatio = -pos.pnl / pos.margin;
-      const stop = engine.stopRatio.get(pos.id) ?? STOP_RATIO;
-      if (lossRatio >= stop) { closeTrade(pos, '止损'); continue; }
-
-      if (driftMode) {
-        // 漂移引擎：持有到期即平 —— 累积漂移已经兑现
-        const exitAt = engine.exitBars.get(pos.id);
-        if (exitAt != null && engine.barCount >= exitAt) { closeTrade(pos, '到期'); continue; }
-        // 零交叉反手：从现在起的最优漂移窗口已经指向反面，剩余持有期是负期望 → 提前离场换向
-        const sig = ctx.driftByPair.get(pos.pair);
-        if (sig && sig.side !== pos.side) { closeTrade(pos, '反手'); continue; }
-        continue;
+      for (const id of state.entryBars.keys()) {
+        if (!snap.positions.some(p => p.id === id)) {
+          state.entryBars.delete(id);
+          state.exitBars.delete(id);
+          state.stopRatio.delete(id);
+        }
       }
+      return exits;
+    }
 
-      if (pos.pnl > 0 && pos.pnl / pos.margin >= cfg.takeProfitRatio) { closeTrade(pos, '止盈'); continue; }
+    function onSeries({ snap, ctx }) {
+      prepareFused(ctx);
+      const exits = computeExits(snap, ctx);
+      if (exits.length) bus.emit(EV.ENGINE_EXITS, { exits });
+      const plan = isDriftMode(snap.mode) ? planDrift(snap, ctx) : (planLookahead(snap, ctx) || planIndicator(snap, ctx));
+      state.pending = plan;
+      bus.emit(EV.ENGINE_PLAN, { plan });
+    }
 
-      const ind = ctx.indMap.get(pos.pair);
-      if (ind) {
-        const against = pos.side === 1 ? ind.score <= -cfg.reverseExitScore : ind.score >= cfg.reverseExitScore;
-        if (against) { closeTrade(pos, '反转'); continue; }
+    function init() {
+      bus.on(EV.CONFIG_CHANGED, ({ cfg }) => { state.cfg = cfg; });
+      bus.on(EV.DATA_BAR, ({ at, count }) => { state.tickAt = at; state.barCount = count; });
+      bus.on(EV.NEWS_CHANGED, ({ news }) => { state.news = news; });
+      bus.on(EV.SERIES_READY, onSeries);
+      bus.on(EV.EXEC_OPENED, ({ position, plan }) => {
+        if (!position) return;
+        if (plan.horizon != null) state.exitBars.set(position.id, state.barCount + plan.horizon);
+        state.stopRatio.set(position.id, plan.stopRatio || STOP_RATIO);
+        state.lastActionAt = Date.now();
+      });
+      bus.on(EV.EXEC_CLOSED, ({ position }) => {
+        if (!position) return;
+        state.pairCooldown.set(position.pair, { at: Date.now(), side: position.side });
+      });
+      bus.on(EV.UI_COMMAND, ({ cmd, value }) => {
+        if (cmd === 'suppress') state.suppressUntil = Date.now() + (value || SUPPRESS_MS);
+        if (cmd === 'action') state.lastActionAt = Date.now();
+      });
+      return {
+        dispose() {},
+        debug: { state, computeExits, planDrift, planIndicator, get pending() { return state.pending; } }
+      };
+    }
+
+    return { init };
+  }
+
+  /* ========================================================= 模块 6：exec */
+
+  function createExec(bus) {
+    const state = {
+      cfg: Object.assign({}, DEFAULTS),
+      bridge: null,
+      lastActionAt: 0,
+      lastAdvanceAt: 0,
+      suppressUntil: 0,
+      pending: null,
+      fastForward: { active: false, remaining: 0 }
+    };
+    const closeQueue = { active: false, remaining: 0, lastCount: Infinity };
+    const log = msg => bus.emit(EV.LOG, { msg });
+
+    function setField(id, value) {
+      const node = $(id);
+      if (!node) return false;
+      node.value = String(value);
+      node.dispatchEvent(new PAGE.Event('input', { bubbles: true }));
+      node.dispatchEvent(new PAGE.Event('change', { bubbles: true }));
+      return true;
+    }
+
+    const call = (name, args) => state.bridge ? state.bridge.call(name, args) : { status: STATUS.MISSING };
+
+    function openTrade(plan) {
+      const res = call('place_fx_trade', { pair: plan.pair, side: plan.side === 1 ? 'long' : 'short', margin: plan.margin, leverage: plan.leverage });
+      if (res.status === STATUS.OK) {
+        log('开仓 ' + plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' 保证金 ' + money(plan.margin) + ' @' + plan.leverage + 'x');
+        return true;
       }
-
-      const bars = engine.barCount - engine.entryBars.get(pos.id);
-      if (bars >= cfg.timeStopBars && pos.pnl <= 0) closeTrade(pos, '时间止损');
+      if (res.status === STATUS.FAILED) {
+        log('开仓被拒：' + (res.error?.message ? res.error.message : String(res.error)));
+        return false;
+      }
+      setField('leverageRange', plan.leverage);
+      setField('marginInput', plan.margin);
+      for (const row of PAGE.document.querySelectorAll('#pairList .pair-row')) {
+        if (String(row.textContent).indexOf(plan.pair) === 0) { row.click(); break; }
+      }
+      const btn = $(plan.side === 1 ? 'longBtn' : 'shortBtn');
+      if (!btn) { log('找不到下单按钮'); return false; }
+      btn.click();
+      log('开仓(DOM) ' + plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' 保证金 ' + money(plan.margin));
+      return true;
     }
-    for (const id of engine.entryBars.keys()) {
-      if (!snap.positions.some(p => p.id === id)) { engine.entryBars.delete(id); engine.exitBars.delete(id); }
+
+    function domCloseRow(position) {
+      const rows = Array.from(PAGE.document.querySelectorAll('#positions .position-row'));
+      if (!rows.length) return null;
+      const sideText = position.side === 1 ? '做多' : '做空';
+      return rows.find(row => {
+        const text = String(row.textContent);
+        return text.indexOf(position.pair) >= 0 && text.indexOf(sideText) >= 0;
+      }) || null;
     }
+
+    function closeTrade(position, reason) {
+      if (!position) return false;
+      const res = call('close_fx_trade', { id: position.id });
+      if (res.status === STATUS.OK) {
+        log('平仓 ' + position.pair + (reason ? '(' + reason + ')' : '') + ' 盈亏 ' + signedMoney(position.pnl || 0));
+        bus.emit(EV.EXEC_CLOSED, { position, reason });
+        return true;
+      }
+      if (res.status === STATUS.FAILED) {
+        log('平仓被拒：' + (res.error?.message ? res.error.message : String(res.error)));
+        return false;
+      }
+      const btn = domCloseRow(position)?.querySelector('button');
+      if (!btn) return false;
+      btn.click();
+      log('平仓(DOM) ' + position.pair + (reason ? '(' + reason + ')' : ''));
+      bus.emit(EV.EXEC_CLOSED, { position, reason });
+      return true;
+    }
+
+    function advanceDay() {
+      if (call('advance_real_fx_day').status === STATUS.OK) return true;
+      const btn = $('nextDayBtn');
+      if (btn && !btn.classList.contains('hidden')) { btn.click(); return true; }
+      return false;
+    }
+
+    // 弹窗节点是静态 HTML，缓存引用省掉每 1.5s 三次 getElementById
+    let modalRefs = null;
+    const refs = () => (modalRefs || (modalRefs = { modal: $('modal'), cancel: $('modalCancel'), confirm: $('modalConfirm') }));
+
+    // 只清理「无 modalAction」的弹窗：modalCancel 的显隐是 openModal 里 action 有无的镜像
+    function sweepModals() {
+      const r = refs();
+      if (!r.modal || r.modal.classList.contains('hidden')) return false;
+      if (r.cancel && !r.cancel.classList.contains('hidden')) return false;
+      if (!r.confirm) return false;
+      r.confirm.click();
+      return true;
+    }
+
+    function startCloseAll() {
+      bus.emit(EV.UI_COMMAND, { cmd: 'suppress', value: SUPPRESS_MS });
+      closeQueue.active = true;
+      closeQueue.remaining = 20;
+      closeQueue.lastCount = Infinity;
+      bus.emit(EV.DATA_REQUEST);
+    }
+
+    // 判据是「持仓数必须严格递减」：DOM 通道的 id 是下标，平仓后会重编号
+    function pumpCloseAll(snap) {
+      if (!closeQueue.active) return;
+      const count = snap.positions.length;
+      if (!count) { closeQueue.active = false; return; }
+      if (count >= closeQueue.lastCount) {
+        closeQueue.active = false;
+        log('全平中止：' + snap.positions[0].pair + ' 未能平仓');
+        return;
+      }
+      if (--closeQueue.remaining < 0) { closeQueue.active = false; return; }
+      closeQueue.lastCount = count;
+      closeTrade(snap.positions[0], '全平');
+    }
+
+    function execute(plan) {
+      if (!plan || state.cfg.automation !== MODE.AUTO) return;
+      const now = Date.now();
+      if (now <= state.suppressUntil || now - state.lastActionAt <= ACTION_COOLDOWN_MS) return;
+      state.lastActionAt = now;
+      bus.emit(EV.UI_COMMAND, { cmd: 'action' });
+      if (!openTrade(plan)) return;
+      const res = call('read_fx_game_state');
+      const raw = res.status === STATUS.OK ? res.value.positions.find(p => p.pair === plan.pair) : null;
+      const position = raw ? { id: raw.id, pair: raw.pair, side: raw.side === 'long' ? 1 : -1, margin: raw.margin, leverage: raw.leverage, entry: raw.entry, pnl: raw.pnl } : null;
+      bus.emit(EV.EXEC_OPENED, { position, plan });
+    }
+
+    function init() {
+      bus.on(EV.BRIDGE_READY, bridge => { state.bridge = bridge; });
+      bus.on(EV.CONFIG_CHANGED, ({ cfg }) => { state.cfg = cfg; });
+      bus.on(EV.ENGINE_PLAN, ({ plan }) => { state.pending = plan; execute(plan); });
+      bus.on(EV.ENGINE_EXITS, ({ exits }) => { for (const exit of exits) closeTrade(exit.position, exit.reason); });
+      bus.on(EV.UI_SWEEP, () => { sweepModals(); });
+      bus.on(EV.UI_COMMAND, ({ cmd, value }) => {
+        if (cmd === 'suppress') state.suppressUntil = Date.now() + (value || SUPPRESS_MS);
+        if (cmd === 'closeall') startCloseAll();
+        if (cmd === 'exec') {
+          if (!state.pending) { log('当前没有待执行信号'); return; }
+          openTrade(state.pending);
+        }
+        if (cmd === 'fast') {
+          state.fastForward.active = true;
+          state.fastForward.remaining = value || 30;
+          log('快进 ' + state.fastForward.remaining + ' 个交易日（风控全程生效）');
+        }
+      });
+      bus.on(EV.DATA_SNAPSHOT, ({ snap }) => {
+        pumpCloseAll(snap);
+        if (state.fastForward.active) {
+          if (isDriftMode(snap.mode)) { state.fastForward.active = false; log('快进只用于真实回放 / 经典战役'); return; }
+          if (state.fastForward.remaining > 0) {
+            if (advanceDay()) state.fastForward.remaining--;
+            else { state.fastForward.active = false; log('快进中断'); }
+          } else {
+            state.fastForward.active = false;
+            log('快进结束');
+          }
+          return;
+        }
+        // 回放模式全自动：按 DAY_ADVANCE_MS 节奏推进交易日
+        if (!isDriftMode(snap.mode) && state.cfg.automation === MODE.AUTO) {
+          const now = Date.now();
+          if (now - state.lastAdvanceAt < DAY_ADVANCE_MS) return;
+          state.lastAdvanceAt = now;
+          advanceDay();
+        }
+      });
+      return {
+        dispose() {},
+        debug: { closeAllPositions: startCloseAll, sweepModals, openTrade, closeTrade, advanceDay, state, get pending() { return state.pending; } }
+      };
+    }
+
+    return { init };
   }
 
-  function registerExit(position, plan) {
-    if (!position) return;
-    const id = position.id || (position.value && position.value.id);
-    if (!id) return;
-    engine.exitBars.set(id, engine.barCount + (plan.horizon || DRIFT_MAX_BARS));
-    engine.stopRatio.set(id, plan.stopRatio || STOP_RATIO);
+  /* ======================================================== 模块 7：input */
+
+  function createInput(bus) {
+    const state = { root: null, head: null, mobile: false, collapsed: false, query: null, dragging: false };
+    let cleanup = [];
+
+    function persist(key, value) {
+      try { PAGE.localStorage.setItem(key, value); } catch {}
+    }
+
+    function clampToViewport(x, y) {
+      const rect = state.root.getBoundingClientRect();
+      return {
+        x: clamp(x, 0, Math.max(0, PAGE.innerWidth - rect.width)),
+        y: clamp(y, 0, Math.max(0, PAGE.innerHeight - rect.height))
+      };
+    }
+
+    function applyPosition(left, top) {
+      const next = clampToViewport(left, top);
+      state.root.style.right = 'auto';
+      state.root.style.bottom = 'auto';
+      state.root.style.left = next.x + 'px';
+      state.root.style.top = next.y + 'px';
+    }
+
+    function restorePosition() {
+      try {
+        const raw = PAGE.localStorage.getItem(POS_KEY);
+        if (!raw) return;
+        const pos = JSON.parse(raw);
+        if (!pos?.left || !pos?.top) return;
+        applyPosition(parseFloat(pos.left) || 12, parseFloat(pos.top) || 12);
+      } catch {}
+    }
+
+    function setCollapsed(next) {
+      state.collapsed = next;
+      state.root.classList.toggle('fxq-collapsed', next);
+      const fold = state.root.querySelector('[data-fxq="fold"]');
+      if (fold) fold.textContent = next ? '+' : '—';
+      persist(FOLD_KEY, next ? '1' : '0');
+      bus.emit(EV.UI_STATE, { collapsed: next, mobile: state.mobile });
+    }
+
+    function applyBreakpoint() {
+      const wasMobile = state.mobile;
+      state.mobile = state.query ? state.query.matches : PAGE.innerWidth <= MOBILE_BREAKPOINT;
+      state.root.classList.toggle('fxq-mobile', state.mobile);
+      // 移动端首次进入默认折叠：展开态 300×500 会盖住下单区
+      if (state.mobile && !wasMobile) {
+        let saved = null;
+        try { saved = PAGE.localStorage.getItem(FOLD_KEY); } catch {}
+        if (saved === '1' || saved === null) { setCollapsed(true); return; }
+      }
+      bus.emit(EV.UI_STATE, { collapsed: state.collapsed, mobile: state.mobile });
+    }
+
+    // Pointer Events：鼠标 / 触摸 / 笔同一套；setPointerCapture 保证移出元素也跟手
+    function makeDraggable() {
+      const head = state.head;
+      let sx = 0, sy = 0, ox = 0, oy = 0, pid = null;
+
+      const onDown = e => {
+        if (e.target.classList.contains('fxq-btn')) return;
+        const rect = state.root.getBoundingClientRect();
+        state.dragging = true;
+        pid = e.pointerId;
+        sx = e.clientX; sy = e.clientY; ox = rect.left; oy = rect.top;
+        state.root.style.right = 'auto';
+        state.root.style.bottom = 'auto';
+        state.root.style.left = ox + 'px';
+        state.root.style.top = oy + 'px';
+        try { head.setPointerCapture(pid); } catch {}
+        e.preventDefault();
+      };
+
+      const onMove = e => {
+        if (!state.dragging || e.pointerId !== pid) return;
+        applyPosition(ox + e.clientX - sx, oy + e.clientY - sy);
+      };
+
+      const onUp = e => {
+        if (!state.dragging || (pid !== null && e.pointerId !== pid)) return;
+        state.dragging = false;
+        try { head.releasePointerCapture(pid); } catch {}
+        pid = null;
+        persist(POS_KEY, JSON.stringify({ left: state.root.style.left, top: state.root.style.top }));
+      };
+
+      head.addEventListener('pointerdown', onDown);
+      head.addEventListener('pointermove', onMove);
+      head.addEventListener('pointerup', onUp);
+      head.addEventListener('pointercancel', onUp);
+      cleanup.push(() => {
+        head.removeEventListener('pointerdown', onDown);
+        head.removeEventListener('pointermove', onMove);
+        head.removeEventListener('pointerup', onUp);
+        head.removeEventListener('pointercancel', onUp);
+      });
+    }
+
+    function init() {
+      bus.on(EV.UI_MOUNTED, ({ root, head }) => {
+        state.root = root;
+        state.head = head;
+        makeDraggable();
+        restorePosition();
+
+        const fold = root.querySelector('[data-fxq="fold"]');
+        if (fold) fold.addEventListener('click', () => setCollapsed(!state.collapsed));
+
+        if (PAGE.matchMedia) {
+          state.query = PAGE.matchMedia('(max-width: ' + MOBILE_BREAKPOINT + 'px)');
+          const onChange = () => applyBreakpoint();
+          if (state.query.addEventListener) state.query.addEventListener('change', onChange);
+          else if (state.query.addListener) state.query.addListener(onChange);
+          cleanup.push(() => {
+            if (state.query.removeEventListener) state.query.removeEventListener('change', onChange);
+            else if (state.query.removeListener) state.query.removeListener(onChange);
+          });
+        }
+        const onViewport = () => applyBreakpoint();
+        if (PAGE.visualViewport) {
+          PAGE.visualViewport.addEventListener('resize', onViewport);
+          cleanup.push(() => PAGE.visualViewport.removeEventListener('resize', onViewport));
+        }
+        applyBreakpoint();
+      });
+      return {
+        dispose() { for (const fn of cleanup) fn(); cleanup = []; },
+        debug: { state, applyBreakpoint, setCollapsed, restorePosition }
+      };
+    }
+
+    return { init };
   }
 
-  /* ------------------------------------------------------------------ UI */
+  /* =========================================================== 模块 8：ui */
 
-  const ui = { ready: false, collapsed: false };
+  function createUi(bus) {
+    const ui = { ready: false, root: null, collapsed: false, mobile: false };
+    const state = { cfg: Object.assign({}, DEFAULTS), snap: null, ctx: null, plan: null };
+    const logLines = [];
+    const log = msg => bus.emit(EV.LOG, { msg });
 
-  const CSS = [
-    '.fxq-panel{position:fixed;left:12px;bottom:12px;width:302px;z-index:2147483000;',
-    'font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;',
-    'color:#e8f3ee;background:linear-gradient(160deg,rgba(18,38,40,.97),rgba(10,23,25,.98));',
-    'border:1px solid rgba(120,200,170,.28);border-radius:14px;box-shadow:0 18px 44px rgba(0,0,0,.45);',
-    'backdrop-filter:blur(10px);overflow:hidden;user-select:none}',
-    '.fxq-panel.fxq-collapsed{width:auto}',
-    '.fxq-panel.fxq-collapsed .fxq-body{display:none}',
-    '.fxq-head{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:move;',
-    'background:rgba(255,255,255,.04);border-bottom:1px solid rgba(120,200,170,.16)}',
-    '.fxq-title{font-weight:600;letter-spacing:.4px;flex:1;font-size:12px}',
-    '.fxq-dot{width:7px;height:7px;border-radius:50%;background:#57cf9b;box-shadow:0 0 8px #57cf9b}',
-    '.fxq-dot.warn{background:#efb35f;box-shadow:0 0 8px #efb35f}',
-    '.fxq-dot.bad{background:#ef8ba0;box-shadow:0 0 8px #ef8ba0}',
-    '.fxq-btn{border:1px solid rgba(120,200,170,.35);background:rgba(120,200,170,.1);color:#cdeee0;',
-    'border-radius:7px;padding:2px 7px;font-size:11px;cursor:pointer;font-family:inherit}',
-    '.fxq-btn:hover{background:rgba(120,200,170,.22)}',
-    '.fxq-btn.on{background:#57cf9b;border-color:#57cf9b;color:#08201a;font-weight:600}',
-    '.fxq-body{padding:9px 11px 11px;display:flex;flex-direction:column;gap:8px}',
-    '.fxq-row{display:flex;align-items:center;justify-content:space-between;gap:6px}',
-    '.fxq-kv{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 6px}',
-    '.fxq-kv div{background:rgba(255,255,255,.045);border-radius:6px;padding:3px 6px}',
-    '.fxq-kv span{display:block;font-size:10px;color:#7fa79a}',
-    '.fxq-kv b{font-size:11.5px;font-weight:600}',
-    '.fxq-bar{height:7px;border-radius:4px;background:rgba(255,255,255,.09);position:relative;overflow:hidden}',
-    '.fxq-bar i{position:absolute;top:0;bottom:0;left:50%;width:2px;background:rgba(255,255,255,.35)}',
-    '.fxq-bar b{position:absolute;top:0;bottom:0;border-radius:4px;transition:all .2s}',
-    '.fxq-sig{font-weight:600;font-size:13px}',
-    '.fxq-log{max-height:76px;overflow:auto;font-size:10.5px;line-height:1.45;color:#8fb5a7;',
-    'background:rgba(0,0,0,.24);border-radius:7px;padding:5px 7px;white-space:pre-wrap;word-break:break-all}',
-    '.fxq-advice{background:rgba(87,207,155,.1);border:1px solid rgba(87,207,155,.3);border-radius:8px;padding:6px 8px}',
-    '.fxq-advice.sell{background:rgba(239,139,160,.1);border-color:rgba(239,139,160,.32)}',
-    '.fxq-seg{display:flex;gap:4px}',
-    '.fxq-seg .fxq-btn{flex:1;text-align:center}',
-    '.fxq-hint{font-size:10px;color:#6f9488}',
-    '.fxq-hint b{cursor:pointer;border-bottom:1px dashed rgba(120,200,170,.45)}',
-    '.fxq-hint b:hover{color:#57cf9b}',
-    '.fxq-pos{font-size:10.5px;color:#9dc4b6;word-break:break-all}',
-    '.fxq-up{color:#57cf9b}.fxq-down{color:#ef8ba0}'
-  ].join('');
+    const CSS = [
+      '.fxq-panel{position:fixed;left:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));width:302px;z-index:2147483000;',
+      'font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;',
+      'color:#e8f3ee;background:linear-gradient(160deg,rgba(18,38,40,.97),rgba(10,23,25,.98));',
+      'border:1px solid rgba(120,200,170,.28);border-radius:14px;box-shadow:0 18px 44px rgba(0,0,0,.45);',
+      'backdrop-filter:blur(10px);overflow:hidden;user-select:none;max-width:calc(100vw - 24px);',
+      'max-height:calc(100dvh - 24px);display:flex;flex-direction:column}',
+      '.fxq-panel.fxq-collapsed{width:auto}',
+      '.fxq-panel.fxq-collapsed .fxq-body{display:none}',
+      '.fxq-head{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:move;',
+      'background:rgba(255,255,255,.04);border-bottom:1px solid rgba(120,200,170,.16);',
+      'touch-action:none;min-height:34px;flex:0 0 auto}',
+      '.fxq-title{font-weight:600;letter-spacing:.4px;flex:1;font-size:12px}',
+      '.fxq-dot{width:7px;height:7px;border-radius:50%;background:#57cf9b;box-shadow:0 0 8px #57cf9b;flex:0 0 auto}',
+      '.fxq-dot.warn{background:#efb35f;box-shadow:0 0 8px #efb35f}',
+      '.fxq-dot.bad{background:#ef8ba0;box-shadow:0 0 8px #ef8ba0}',
+      '.fxq-btn{border:1px solid rgba(120,200,170,.35);background:rgba(120,200,170,.1);color:#cdeee0;',
+      'border-radius:7px;padding:2px 7px;font-size:11px;cursor:pointer;font-family:inherit;',
+      'min-height:26px;touch-action:manipulation}',
+      '.fxq-btn:hover{background:rgba(120,200,170,.22)}',
+      '.fxq-btn.on{background:#57cf9b;border-color:#57cf9b;color:#08201a;font-weight:600}',
+      '.fxq-body{padding:9px 11px 11px;display:flex;flex-direction:column;gap:8px;overflow:auto;overscroll-behavior:contain}',
+      '.fxq-row{display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap}',
+      '.fxq-kv{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 6px}',
+      '.fxq-kv div{background:rgba(255,255,255,.045);border-radius:6px;padding:3px 6px;min-width:0}',
+      '.fxq-kv span{display:block;font-size:10px;color:#7fa79a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.fxq-kv b{font-size:11.5px;font-weight:600}',
+      '.fxq-bar{height:7px;border-radius:4px;background:rgba(255,255,255,.09);position:relative;overflow:hidden}',
+      '.fxq-bar i{position:absolute;top:0;bottom:0;left:50%;width:2px;background:rgba(255,255,255,.35)}',
+      '.fxq-bar b{position:absolute;top:0;bottom:0;border-radius:4px;transition:all .2s}',
+      '.fxq-sig{font-weight:600;font-size:13px}',
+      '.fxq-log{max-height:76px;overflow:auto;font-size:10.5px;line-height:1.45;color:#8fb5a7;',
+      'background:rgba(0,0,0,.24);border-radius:7px;padding:5px 7px;white-space:pre-wrap;word-break:break-all}',
+      '.fxq-advice{background:rgba(87,207,155,.1);border:1px solid rgba(87,207,155,.3);border-radius:8px;padding:6px 8px}',
+      '.fxq-advice.sell{background:rgba(239,139,160,.1);border-color:rgba(239,139,160,.32)}',
+      '.fxq-seg{display:flex;gap:4px}',
+      '.fxq-seg .fxq-btn{flex:1;text-align:center}',
+      '.fxq-hint{font-size:10px;color:#6f9488}',
+      '.fxq-hint b{cursor:pointer;border-bottom:1px dashed rgba(120,200,170,.45)}',
+      '.fxq-hint b:hover{color:#57cf9b}',
+      '.fxq-pos{font-size:10.5px;color:#9dc4b6;word-break:break-all}',
+      '.fxq-up{color:#57cf9b}.fxq-down{color:#ef8ba0}',
+      '.fxq-panel.fxq-mobile{width:min(302px,calc(100vw - 24px));font-size:11px}',
+      '.fxq-panel.fxq-mobile .fxq-head{padding:11px 12px;min-height:44px}',
+      '.fxq-panel.fxq-mobile .fxq-btn{min-height:32px;padding:4px 9px;font-size:12px}',
+      '.fxq-panel.fxq-mobile .fxq-body{padding:10px 12px 12px;gap:9px}',
+      '.fxq-panel.fxq-mobile .fxq-log{max-height:60px}'
+    ].join('');
 
-  function make(tag, cls, text) {
-    const node = PAGE.document.createElement(tag);
-    if (cls) node.className = cls;
-    if (text != null) node.textContent = text;
-    return node;
-  }
-
-  const PANEL_HTML = [
+    const PANEL_HTML = [
       '<div class="fxq-head"><span class="fxq-dot" data-fxq="dot"></span>',
       '<span class="fxq-title">FX 量化辅助台</span>',
       '<button class="fxq-btn" data-fxq="fold">—</button></div>',
@@ -1079,354 +1559,285 @@
       '  <div class="fxq-pos" data-fxq="posline">无持仓</div>',
       '  <div class="fxq-log" data-fxq="log"></div>',
       '</div>'
-  ].join('');
+    ].join('');
 
-  function bindRefs(root) {
-    const q = key => root.querySelector('[data-fxq="' + key + '"]');
-    Object.assign(ui, {
-      ready: true, root,
-      dot: q('dot'), via: q('via'), mode: q('mode'), sig: q('sig'), src: q('src'), k1: q('k1'),
-      bar: q('bar'), ema: q('ema'), rsi: q('rsi'), atr: q('atr'), macd: q('macd'),
-      boll: q('boll'), roc: q('roc'), advice: q('advice'), lev: q('lev'), risk: q('risk'),
-      look: q('look'), equity: q('equity'), cash: q('cash'), float: q('float'),
-      posline: q('posline'), log: q('log'),
-      autoOff: q('auto-off'), autoConfirm: q('auto-confirm'), autoAuto: q('auto-auto'),
-      exec: q('exec'), closeall: q('closeall'), fast: q('fast'), fold: q('fold')
-    });
-  }
-
-  function wireEvents(root) {
-    ui.fold.addEventListener('click', () => {
-      ui.collapsed = !ui.collapsed;
-      root.classList.toggle('fxq-collapsed', ui.collapsed);
-      ui.fold.textContent = ui.collapsed ? '+' : '—';
-    });
-
-    const setAutomation = level => {
-      cfg.automation = level;
-      saveConfig();
-      renderAutomation();
-      log('自动化切换为「' + ({ off: '关闭', confirm: '确认', auto: '全自动' })[level] + '」');
+    const setText = (node, text, cls) => {
+      if (!node) return;
+      if (node.textContent !== text) node.textContent = text;
+      if (cls !== undefined && node.className !== cls) node.className = cls;
     };
-    ui.autoOff.addEventListener('click', () => setAutomation('off'));
-    ui.autoConfirm.addEventListener('click', () => setAutomation('confirm'));
-    ui.autoAuto.addEventListener('click', () => setAutomation('auto'));
 
-    ui.look.addEventListener('click', () => {
-      cfg.allowLookahead = !cfg.allowLookahead;
-      saveConfig();
-      renderAutomation();
-      log(cfg.allowLookahead ? '已开启前瞻（real/battle 使用未来数据，属作弊）' : '已关闭前瞻');
-    });
+    const setStyle = (node, prop, value) => {
+      if (!node || node.style[prop] === value) return;
+      node.style[prop] = value;
+    };
 
-    ui.exec.addEventListener('click', () => {
-      const plan = engine.pending;
-      if (!plan) { log('当前没有待执行信号'); return; }
-      if (openTrade(plan.pair, plan.side, plan.margin, plan.leverage)) engine.pending = null;
-    });
+    function bindRefs(root) {
+      const q = key => root.querySelector('[data-fxq="' + key + '"]');
+      Object.assign(ui, {
+        ready: true, root,
+        dot: q('dot'), via: q('via'), mode: q('mode'), sig: q('sig'), src: q('src'), k1: q('k1'),
+        bar: q('bar'), ema: q('ema'), rsi: q('rsi'), atr: q('atr'), macd: q('macd'),
+        boll: q('boll'), roc: q('roc'), advice: q('advice'), lev: q('lev'), risk: q('risk'),
+        look: q('look'), equity: q('equity'), cash: q('cash'), float: q('float'),
+        posline: q('posline'), log: q('log'),
+        autoOff: q('auto-off'), autoConfirm: q('auto-confirm'), autoAuto: q('auto-auto'),
+        exec: q('exec'), closeall: q('closeall'), fast: q('fast'), fold: q('fold')
+      });
+    }
 
-    ui.closeall.addEventListener('click', () => {
-      if (!closeAllPositions()) log('当前没有持仓');
-    });
+    function wireEvents() {
+      const setAutomation = level => bus.emit(EV.CONFIG_SAVE, { patch: { automation: level } });
+      ui.autoOff.addEventListener('click', () => setAutomation(MODE.OFF));
+      ui.autoConfirm.addEventListener('click', () => setAutomation(MODE.CONFIRM));
+      ui.autoAuto.addEventListener('click', () => setAutomation(MODE.AUTO));
+      ui.look.addEventListener('click', () => bus.emit(EV.CONFIG_SAVE, { patch: { allowLookahead: !state.cfg.allowLookahead } }));
+      ui.exec.addEventListener('click', () => bus.emit(EV.UI_COMMAND, { cmd: 'exec' }));
+      ui.closeall.addEventListener('click', () => bus.emit(EV.UI_COMMAND, { cmd: 'closeall' }));
+      ui.fast.addEventListener('click', () => bus.emit(EV.UI_COMMAND, { cmd: 'fast', value: 30 }));
 
-    ui.fast.addEventListener('click', () => runFastForward(30));
+      const LEVS = [5, 10, 20, 30, 50, 100];
+      const RISKS = [0.05, 0.1, 0.12, 0.15, 0.2, 0.3];
+      ui.lev.addEventListener('click', () => {
+        bus.emit(EV.CONFIG_SAVE, { patch: { leverage: LEVS[(LEVS.indexOf(state.cfg.leverage) + 1) % LEVS.length] } });
+      });
+      ui.risk.addEventListener('click', () => {
+        if (state.cfg.sizeMode === SIZE_MODE.KELLY) bus.emit(EV.CONFIG_SAVE, { patch: { sizeMode: SIZE_MODE.FIXED, riskPct: RISKS[0] } });
+        else {
+          const next = RISKS.indexOf(state.cfg.riskPct) + 1;
+          if (next >= RISKS.length) bus.emit(EV.CONFIG_SAVE, { patch: { sizeMode: SIZE_MODE.KELLY } });
+          else bus.emit(EV.CONFIG_SAVE, { patch: { riskPct: RISKS[next] } });
+        }
+      });
+    }
 
-    const LEVS = [5, 10, 20, 30, 50, 100];
-    const RISKS = [0.05, 0.1, 0.12, 0.15, 0.2, 0.3];
-    ui.lev.addEventListener('click', () => {
-      cfg.leverage = LEVS[(LEVS.indexOf(cfg.leverage) + 1) % LEVS.length];
-      saveConfig(); renderAutomation();
-      log('杠杆 → ' + cfg.leverage + '×');
-    });
-    ui.risk.addEventListener('click', () => {
-      if (cfg.sizeMode === 'kelly') {
-        cfg.sizeMode = 'fixed';
-        cfg.riskPct = RISKS[0];
-      } else {
-        const next = RISKS.indexOf(cfg.riskPct) + 1;
-        if (next >= RISKS.length) cfg.sizeMode = 'kelly';
-        else cfg.riskPct = RISKS[next];
-      }
-      saveConfig(); renderAutomation();
-      log(cfg.sizeMode === 'kelly' ? '定量 → 半凯利' : '定量 → 固定 ' + Math.round(cfg.riskPct * 100) + '%');
-    });
+    function renderAutomation() {
+      if (!ui.ready) return;
+      ui.autoOff.classList.toggle('on', state.cfg.automation === MODE.OFF);
+      ui.autoConfirm.classList.toggle('on', state.cfg.automation === MODE.CONFIRM);
+      ui.autoAuto.classList.toggle('on', state.cfg.automation === MODE.AUTO);
+      ui.look.classList.toggle('on', !!state.cfg.allowLookahead);
+      ui.lev.textContent = state.cfg.leverage + '×';
+      const kelly = kellyFraction(state.ctx ? state.ctx.history : [], state.cfg);
+      ui.risk.textContent = state.cfg.sizeMode === SIZE_MODE.KELLY ? '凯利 ' + Math.round(kelly * 100) + '%' : Math.round(state.cfg.riskPct * 100) + '%';
+    }
 
-    makeDraggable(root, root.querySelector('.fxq-head'));
-  }
+    const MODE_LABEL = { sim: '模拟行情', real: '真实回放', battle: '经典战役', challenge: '每日挑战' };
 
-  function buildUI() {
-    if (ui.ready) return;
-    const host = PAGE.document.body;
-    if (!host) return;
-    const style = make('style');
-    style.textContent = CSS;
-    PAGE.document.head.appendChild(style);
-    const root = make('div', 'fxq-panel');
-    root.innerHTML = PANEL_HTML;
-    host.appendChild(root);
-    bindRefs(root);
-    wireEvents(root);
-    renderAutomation();
-  }
+    function renderIndicators(ind) {
+      setText(ui.ema, priceText(ind.pair, Math.abs(ind.ema12 - ind.ema26)), ind.ema12 >= ind.ema26 ? 'fxq-up' : 'fxq-down');
+      setText(ui.rsi, ind.rsi14 === null ? '—' : ind.rsi14.toFixed(1));
+      setText(ui.atr, (ind.atrPct * 100).toFixed(3) + '%');
+      const macdScaled = ind.macdHist * 10000;
+      setText(ui.macd, (macdScaled >= 0 ? '+' : '') + macdScaled.toFixed(1), ind.macdHist >= 0 ? 'fxq-up' : 'fxq-down');
+      setText(ui.boll, Math.round(ind.bollPos * 100) + '%');
+      setText(ui.roc, (ind.roc10 * 100).toFixed(2) + '%', ind.roc10 >= 0 ? 'fxq-up' : 'fxq-down');
+      setText(ui.src, ind.source);
+    }
 
-  function makeDraggable(node, handle) {
-    let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
-    handle.addEventListener('mousedown', e => {
-      if (e.target.classList.contains('fxq-btn')) return;
-      const rect = node.getBoundingClientRect();
-      dragging = true; sx = e.clientX; sy = e.clientY; ox = rect.left; oy = rect.top;
-      node.style.right = 'auto'; node.style.bottom = 'auto';
-      node.style.left = ox + 'px'; node.style.top = oy + 'px';
-      e.preventDefault();
-    });
-    PAGE.addEventListener('mousemove', e => {
-      if (!dragging) return;
-      node.style.left = (ox + e.clientX - sx) + 'px';
-      node.style.top = (oy + e.clientY - sy) + 'px';
-    });
-    PAGE.addEventListener('mouseup', () => { dragging = false; });
-  }
-
-  function renderAutomation() {
-    if (!ui.ready) return;
-    ui.autoOff.classList.toggle('on', cfg.automation === 'off');
-    ui.autoConfirm.classList.toggle('on', cfg.automation === 'confirm');
-    ui.autoAuto.classList.toggle('on', cfg.automation === 'auto');
-    ui.look.classList.toggle('on', !!cfg.allowLookahead);
-    ui.lev.textContent = cfg.leverage + '×';
-    ui.risk.textContent = cfg.sizeMode === 'kelly' ? '凯利 ' + Math.round(kellyFraction(currentSnap.mode) * 100) + '%' : Math.round(cfg.riskPct * 100) + '%';
-  }
-
-  const MODE_LABEL = { sim: '模拟行情', real: '真实回放', battle: '经典战役', challenge: '每日挑战' };
-
-  function renderIndicators(ind) {
-    setText(ui.ema, priceText(ind.pair, Math.abs(ind.ema12 - ind.ema26)), ind.ema12 >= ind.ema26 ? 'fxq-up' : 'fxq-down');
-    setText(ui.rsi, ind.rsi14 === null ? '—' : ind.rsi14.toFixed(1));
-    setText(ui.atr, (ind.atrPct * 100).toFixed(3) + '%');
-    const macdScaled = ind.macdHist * 10000;
-    setText(ui.macd, (macdScaled >= 0 ? '+' : '') + macdScaled.toFixed(1), ind.macdHist >= 0 ? 'fxq-up' : 'fxq-down');
-    setText(ui.boll, Math.round(ind.bollPos * 100) + '%');
-    setText(ui.roc, (ind.roc10 * 100).toFixed(2) + '%', ind.roc10 >= 0 ? 'fxq-up' : 'fxq-down');
-    setText(ui.src, ind.source);
-  }
-
-  function clearIndicators() {
-    setText(ui.src, '');
-    setText(ui.ema, '—', '');
-    setText(ui.rsi, '—');
-    setText(ui.atr, '—');
-    setText(ui.macd, '—', '');
-    setText(ui.boll, '—');
-    setText(ui.roc, '—', '');
-  }
-
-  function renderPanel(snap, ctx, plan) {
-    if (!ui.ready) return;
-    setText(ui.via, BRIDGE.via === 'api' ? '通道 · 内部 API' : '通道 · DOM 兜底');
-    setText(ui.mode, MODE_LABEL[snap.mode] || snap.mode);
-    setText(ui.k1, isDriftMode(snap.mode) ? '漂移累积' : 'EMA12/26');
-    if (isDriftMode(snap.mode)) renderDriftPanel(snap, ctx, plan);
-    else renderIndicatorPanel(snap, ctx, plan);
-    renderAccountPanel(snap);
-  }
-
-  function renderDriftPanel(snap, ctx, plan) {
-    const top = ctx.drift[0];
-    if (top) {
-      const pct = (top.value * 100).toFixed(2);
-      setText(ui.sig, top.pair + (top.side === 1 ? ' 多' : ' 空') + ' ' + (top.side === 1 ? '+' : '') + pct + '%',
-        'fxq-sig ' + (top.side === 1 ? 'fxq-up' : 'fxq-down'));
-      const half = clamp(Math.abs(top.value) / 0.006 * 50, 0, 50);
-      setStyle(ui.bar, 'left', top.side === 1 ? '50%' : (50 - half) + '%');
-      setStyle(ui.bar, 'width', half + '%');
-      setStyle(ui.bar, 'background', top.side === 1 ? '#57cf9b' : '#ef8ba0');
-      setText(ui.ema, (top.value * 100).toFixed(2) + '%', top.side === 1 ? 'fxq-up' : 'fxq-down');
-      setText(ui.src, '漂移相位 · H=' + top.horizon + 't');
+    function clearIndicators() {
+      setText(ui.src, '');
+      setText(ui.ema, '—', '');
       setText(ui.rsi, '—');
       setText(ui.atr, '—');
-      setText(ui.macd, ctx.drift.length + ' 个', '');
+      setText(ui.macd, '—', '');
       setText(ui.boll, '—');
       setText(ui.roc, '—', '');
-    } else {
-      setText(ui.sig, '无漂移窗口', 'fxq-sig');
-      setStyle(ui.bar, 'width', '0');
-      clearIndicators();
     }
-    setText(ui.advice, plan
-      ? plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' · ' + money(plan.margin) + ' · ' + plan.leverage + '×' + plan.note
-      : (snap.positions.length ? '持仓管理中 · ' + snap.positions.length + ' 笔' : '漂移累积不足 ' + (DRIFT_MIN_SUM * 100).toFixed(2) + '%'),
-      'fxq-advice' + (plan && plan.side < 0 ? ' sell' : ''));
-  }
 
-  function renderIndicatorPanel(snap, ctx, plan) {
-    const ind = ctx.best;
-    if (!ind) {
-      setText(ui.sig, '数据积累中', 'fxq-sig');
-      setStyle(ui.bar, 'left', '50%');
-      setStyle(ui.bar, 'width', '0');
-      clearIndicators();
-      setText(ui.advice, '等待 K 线数据…', 'fxq-advice');
-      return;
+    function renderRiskDot(snap) {
+      if (!snap.positions.length) { setText(ui.dot, '', 'fxq-dot'); return; }
+      const worst = snap.positions.reduce((m, p) => {
+        if (!finite(p.margin) || p.margin <= 0) return m;
+        return Math.max(m, -p.pnl / p.margin);
+      }, 0);
+      setText(ui.dot, '', 'fxq-dot' + (worst >= RISK_WARN ? ' bad' : worst >= STOP_RATIO ? ' warn' : ''));
     }
-    const score = ind.score;
-    const label = score >= 55 ? '强多' : score >= SIGNAL_THRESHOLD ? '偏多'
-      : score <= -55 ? '强空' : score <= -SIGNAL_THRESHOLD ? '偏空' : '中性';
-    setText(ui.sig, label + ' ' + (score >= 0 ? '+' : '') + score.toFixed(0),
-      'fxq-sig ' + (score > 0 ? 'fxq-up' : score < 0 ? 'fxq-down' : ''));
-    const half = Math.abs(score) / 100 * 50;
-    setStyle(ui.bar, 'left', score >= 0 ? '50%' : (50 - half) + '%');
-    setStyle(ui.bar, 'width', half + '%');
-    setStyle(ui.bar, 'background', score >= 0 ? '#57cf9b' : '#ef8ba0');
-    renderIndicators(ind);
-    setText(ui.advice, plan
-      ? plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' · 保证金 ' + money(plan.margin) + ' · ' + plan.leverage + '×' + plan.note
-      : (snap.positions.length ? '持仓管理中 · ' + snap.positions.length + ' 笔' : '无信号（|评分| < ' + SIGNAL_THRESHOLD + '）'),
-      'fxq-advice' + (plan && plan.side < 0 ? ' sell' : ''));
-  }
 
-  function renderAccountPanel(snap) {
-    setText(ui.equity, finite(snap.equity) ? money(snap.equity) : '—');
-    setText(ui.cash, finite(snap.cash) ? money(snap.cash) : '—');
-    const floating = snap.positions.reduce((s, p) => s + (finite(p.pnl) ? p.pnl : 0), 0);
-    setText(ui.float, signedMoney(floating), floating >= 0 ? 'fxq-up' : 'fxq-down');
-    if (!snap.positions.length) {
-      setText(ui.dot, '', 'fxq-dot');
-      setText(ui.posline, '无持仓');
-      return;
+    function renderPanel(snap, ctx, plan) {
+      if (!ui.ready || !snap) return;
+      if (ui.collapsed) { renderRiskDot(snap); return; }
+      setText(ui.via, snap.via === 'api' ? '通道 · 内部 API' : '通道 · DOM 兜底');
+      setText(ui.mode, MODE_LABEL[snap.mode] || snap.mode);
+      setText(ui.k1, isDriftMode(snap.mode) ? '漂移累积' : 'EMA12/26');
+      if (isDriftMode(snap.mode)) renderDriftPanel(snap, ctx, plan);
+      else renderIndicatorPanel(snap, ctx, plan);
+      renderAccountPanel(snap);
     }
-    const worst = snap.positions.reduce((m, p) => {
-      if (!finite(p.margin) || p.margin <= 0) return m;
-      return Math.max(m, -p.pnl / p.margin);
-    }, 0);
-    setText(ui.dot, '', 'fxq-dot' + (worst >= RISK_WARN ? ' bad' : worst >= STOP_RATIO ? ' warn' : ''));
-    setText(ui.posline, snap.positions.map(p => {
-      const ratio = finite(p.margin) && p.margin > 0
-        ? ' (' + (p.pnl >= 0 ? '+' : '') + Math.round(p.pnl / p.margin * 100) + '%)'
-        : '';
-      return p.pair + (p.side === 1 ? '多' : '空') + ' ' + signedMoney(p.pnl || 0) + ratio;
-    }).join('   '));
-  }
 
-  /* -------------------------------------------------------------- 主循环 */
-
-  const fastForward = { active: false, remaining: 0 };
-  let currentSnap = { mode: 'sim', positions: [], prices: {}, cash: 0, equity: 0 };
-
-  function runFastForward(days) {
-    if (isDriftMode(currentSnap.mode)) { log('快进只用于真实回放 / 经典战役'); return; }
-    fastForward.active = true;
-    fastForward.remaining = days;
-    log('快进 ' + days + ' 个交易日（风控全程生效）');
-  }
-
-  // 每轮只取一次快照；漂移模式下技术指标既不用于下单也不用于显示，整段跳过
-  function collectContext(snap) {
-    const ctx = { drift: [], driftByPair: new Map(), ranked: [], indMap: new Map(), best: null };
-    if (isDriftMode(snap.mode)) {
-      ctx.drift = driftSignals(snap, engine.tickAt);
-      for (const sig of ctx.drift) ctx.driftByPair.set(sig.pair, sig);
-      return ctx;
-    }
-    for (const pair of candidatesFor(snap)) {
-      const ind = cachedIndicators(getSeries(snap, pair), pair, snap.mode);
-      if (!ind) continue;
-      ctx.indMap.set(pair, ind);
-      ctx.ranked.push(ind);
-    }
-    ctx.best = ctx.ranked.reduce((best, ind) => !best || Math.abs(ind.score) > Math.abs(best.score) ? ind : best, null);
-    return ctx;
-  }
-
-  // 价格变化即视为一根新 bar；同时用于识别 riskPaused 造成的行情冻结
-  function trackTick(snap) {
-    const priceNow = snap.prices['EUR/USD'];
-    if (finite(priceNow) && priceNow !== engine.priceMemory.value) {
-      engine.priceMemory.value = priceNow;
-      engine.priceMemory.since = Date.now();
-      engine.tickAt = Date.now();
-      engine.barCount++;
-    }
-    if (modalVisible() && Date.now() - engine.priceMemory.since > FREEZE_DETECT_MS) sweepModals();
-  }
-
-  function trackNews() {
-    const newsNow = readNewsBias();
-    if (!newsNow) return;
-    if (engine.news && engine.news.title === newsNow.title) return;
-    engine.news = { tag: newsNow.tag, title: newsNow.title, bias: newsNow.bias, at: Date.now() };
-    log('新闻「' + newsNow.tag + '」' + newsNow.title);
-  }
-
-  function executePlan(plan) {
-    if (!plan || cfg.automation !== 'auto') return;
-    const now = Date.now();
-    if (now <= engine.suppressUntil || now - engine.lastActionAt <= ACTION_COOLDOWN_MS) return;
-    engine.lastActionAt = now;
-    if (!openTrade(plan.pair, plan.side, plan.margin, plan.leverage)) return;
-    engine.pending = null;
-    const opened = snapshot().positions.find(p => p.pair === plan.pair);
-    if (opened) registerExit(opened, plan);
-  }
-
-  function advancePlayback(snap) {
-    if (fastForward.active) {
-      if (fastForward.remaining > 0) {
-        if (advanceDay()) fastForward.remaining--;
-        else { fastForward.active = false; log('快进中断'); }
+    function renderDriftPanel(snap, ctx, plan) {
+      const top = ctx.drift[0];
+      if (top) {
+        const pct = (top.value * 100).toFixed(2);
+        setText(ui.sig, top.pair + (top.side === 1 ? ' 多' : ' 空') + ' ' + (top.side === 1 ? '+' : '') + pct + '%',
+          'fxq-sig ' + (top.side === 1 ? 'fxq-up' : 'fxq-down'));
+        const half = clamp(Math.abs(top.value) / 0.006 * 50, 0, 50);
+        setStyle(ui.bar, 'left', top.side === 1 ? '50%' : (50 - half) + '%');
+        setStyle(ui.bar, 'width', half + '%');
+        setStyle(ui.bar, 'background', top.side === 1 ? '#57cf9b' : '#ef8ba0');
+        setText(ui.ema, (top.value * 100).toFixed(2) + '%', top.side === 1 ? 'fxq-up' : 'fxq-down');
+        setText(ui.src, '漂移相位 · H=' + top.horizon + 't');
+        setText(ui.rsi, '—');
+        setText(ui.atr, '—');
+        setText(ui.macd, ctx.drift.length + ' 个', '');
+        setText(ui.boll, '—');
+        setText(ui.roc, '—', '');
       } else {
-        fastForward.active = false;
-        log('快进结束');
+        setText(ui.sig, '无漂移窗口', 'fxq-sig');
+        setStyle(ui.bar, 'width', '0');
+        clearIndicators();
       }
-      return;
+      setText(ui.advice, plan
+        ? plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' · ' + money(plan.margin) + ' · ' + plan.leverage + '×' + plan.note
+        : (snap.positions.length ? '持仓管理中 · ' + snap.positions.length + ' 笔' : '漂移累积不足 ' + (DRIFT_MIN_SUM * 100).toFixed(2) + '%'),
+        'fxq-advice' + (plan && plan.side < 0 ? ' sell' : ''));
     }
-    const playback = snap.mode === 'real' || snap.mode === 'battle';
-    if (playback && cfg.automation === 'auto' && Date.now() - engine.lastActionAt > DAY_ADVANCE_MS) {
-      engine.lastActionAt = Date.now();
-      advanceDay();
+
+    function renderIndicatorPanel(snap, ctx, plan) {
+      const ind = ctx.best;
+      if (!ind) {
+        setText(ui.sig, '数据积累中', 'fxq-sig');
+        setStyle(ui.bar, 'left', '50%');
+        setStyle(ui.bar, 'width', '0');
+        clearIndicators();
+        setText(ui.advice, '等待 K 线数据…', 'fxq-advice');
+        return;
+      }
+      const score = ind.score;
+      const label = score >= SIGNAL_STRONG ? '强多' : score >= SIGNAL_THRESHOLD ? '偏多'
+        : score <= -SIGNAL_STRONG ? '强空' : score <= -SIGNAL_THRESHOLD ? '偏空' : '中性';
+      setText(ui.sig, label + ' ' + (score >= 0 ? '+' : '') + score.toFixed(0),
+        'fxq-sig ' + (score > 0 ? 'fxq-up' : score < 0 ? 'fxq-down' : ''));
+      const half = Math.abs(score) / 100 * 50;
+      setStyle(ui.bar, 'left', score >= 0 ? '50%' : (50 - half) + '%');
+      setStyle(ui.bar, 'width', half + '%');
+      setStyle(ui.bar, 'background', score >= 0 ? '#57cf9b' : '#ef8ba0');
+      renderIndicators(ind);
+      setText(ui.advice, plan
+        ? plan.pair + (plan.side === 1 ? ' 做多' : ' 做空') + ' · 保证金 ' + money(plan.margin) + ' · ' + plan.leverage + '×' + plan.note
+        : (snap.positions.length ? '持仓管理中 · ' + snap.positions.length + ' 笔' : '无信号（|评分| < ' + SIGNAL_THRESHOLD + '）'),
+        'fxq-advice' + (plan && plan.side < 0 ? ' sell' : ''));
     }
+
+    function renderAccountPanel(snap) {
+      setText(ui.equity, finite(snap.equity) ? money(snap.equity) : '—');
+      setText(ui.cash, finite(snap.cash) ? money(snap.cash) : '—');
+      const floating = snap.positions.reduce((s, p) => s + (finite(p.pnl) ? p.pnl : 0), 0);
+      setText(ui.float, signedMoney(floating), floating >= 0 ? 'fxq-up' : 'fxq-down');
+      renderRiskDot(snap);
+      if (!snap.positions.length) {
+        setText(ui.posline, '无持仓');
+        return;
+      }
+      setText(ui.posline, snap.positions.map(p => {
+        const ratio = finite(p.margin) && p.margin > 0
+          ? ' (' + (p.pnl >= 0 ? '+' : '') + Math.round(p.pnl / p.margin * 100) + '%)'
+          : '';
+        return p.pair + (p.side === 1 ? '多' : '空') + ' ' + signedMoney(p.pnl || 0) + ratio;
+      }).join('   '));
+    }
+
+    function build() {
+      if (ui.ready) return;
+      const host = PAGE.document.body;
+      if (!host) return;
+      const style = PAGE.document.createElement('style');
+      style.textContent = CSS;
+      PAGE.document.head.appendChild(style);
+      const root = PAGE.document.createElement('div');
+      root.className = 'fxq-panel';
+      root.innerHTML = PANEL_HTML;
+      host.appendChild(root);
+      bindRefs(root);
+      wireEvents();
+      renderAutomation();
+      // 挂载完成：把 DOM 句柄交给 input 模块接管拖拽 / 断点 / 位置
+      bus.emit(EV.UI_MOUNTED, { root, head: root.querySelector('.fxq-head') });
+    }
+
+    function init() {
+      bus.on(EV.CONFIG_CHANGED, ({ cfg }) => { state.cfg = cfg; renderAutomation(); });
+      bus.on(EV.UI_STATE, ({ collapsed, mobile }) => { ui.collapsed = collapsed; ui.mobile = mobile; });
+      bus.on(EV.SERIES_READY, ({ snap, ctx }) => {
+        state.snap = snap;
+        state.ctx = ctx;
+        renderPanel(snap, ctx, state.plan);
+      });
+      bus.on(EV.ENGINE_PLAN, ({ plan }) => { state.plan = plan; });
+      bus.on(EV.BRIDGE_BLOCKED, ({ reason }) => log('主世界注入被阻断，改用直挂通道：' + reason));
+      bus.on(EV.LOG, ({ msg }) => {
+        logLines.unshift(TIME_FMT.format(new Date()) + '  ' + msg);
+        if (logLines.length > MAX_LOG) logLines.length = MAX_LOG;
+        if (ui.ready) ui.log.textContent = logLines.slice(0, 6).join('\n');
+      });
+
+      let waits = 0;
+      const boot = () => {
+        if (!PAGE.document.body) { setTimeout(boot, 60); return; }
+        if (!$('longBtn')) { if (++waits < 100) setTimeout(boot, 150); return; }
+        build();
+        log('量化辅助台已就绪 v2.1.0（八模块事件驱动）');
+      };
+      if (PAGE.document.readyState === 'loading') PAGE.document.addEventListener('DOMContentLoaded', boot, { once: true });
+      else boot();
+
+      return { dispose() {}, debug: { ui, logLines, state, renderPanel } };
+    }
+
+    return { init };
   }
 
-  function step() {
-    const snap = snapshot();
-    currentSnap = snap;
-    recordSample(snap);
-    trackTick(snap);
-    trackNews();
+  /* ================================================================ 引导 */
 
-    const ctx = collectContext(snap);
-    manageRisk(snap, ctx);
-    engine.pending = decide(snap, ctx);
-    executePlan(engine.pending);
-    advancePlayback(snap);
+  const bus = createBus();
+  const bridge = createBridge(bus).init();
+  const store = createStore(bus).init();
+  const data = createData(bus).init();
+  const series = createSeries(bus).init();
+  const engine = createEngine(bus).init();
+  const exec = createExec(bus).init();
+  const input = createInput(bus).init();
+  const ui = createUi(bus).init();
 
-    if (modalVisible()) sweepModals();
-    renderPanel(snap, ctx, engine.pending);
-  }
-
-  /* ------------------------------------------------------------------ 启动 */
-
-  installDirectBridge();
-  installScriptBridge();
+  // 调试/测试兼容层：保持 v1 的 __FXQ__ 形状
   PAGE.__FXQ__ = {
-    BRIDGE, cfg, engine, snapshot, computeIndicators, getSeries, hasTool, logLines,
-    closeAllPositions, sweepModals, step, driftSum, bestDrift, driftSignals, debugLog, collectContext
+    BRIDGE: {
+      get tools() { return bridge.debug.tools; },
+      set tools(v) { bridge.debug.setTools(v); },
+      get via() { return bridge.debug.via; },
+      call: bridge.debug.call,
+      has: bridge.debug.has,
+      readSave: bridge.debug.readSave
+    },
+    cfg: store.debug.cfg,
+    engine: {
+      get barCount() { return engine.debug.state.barCount; },
+      get tickAt() { return engine.debug.state.tickAt; },
+      get stopRatio() { return engine.debug.state.stopRatio; },
+      get entryBars() { return engine.debug.state.entryBars; },
+      get exitBars() { return engine.debug.state.exitBars; },
+      get pairCooldown() { return engine.debug.state.pairCooldown; },
+      get pending() { return engine.debug.pending; },
+      get suppressUntil() { return engine.debug.state.suppressUntil; },
+      set suppressUntil(v) { engine.debug.state.suppressUntil = v; },
+      get lastActionAt() { return engine.debug.state.lastActionAt; },
+      get news() { return engine.debug.state.news; },
+      get priceMemory() { return { value: data.debug.state.lastPrice, since: data.debug.state.tickAt }; }
+    },
+    snapshot: data.debug.snapshot,
+    computeIndicators,
+    getSeries: series.debug.getSeries,
+    driftSum,
+    bestDrift,
+    driftSignals: (snap, t0) => driftSignalsFor(snap.mode, t0 || engine.debug.state.tickAt),
+    hasTool: bridge.debug.has,
+    logLines: ui.debug.logLines,
+    closeAllPositions: exec.debug.closeAllPositions,
+    sweepModals: exec.debug.sweepModals,
+    step: data.debug.collect,
+    debugLog: store.debug.debugLog,
+    bus,
+    busStats: bus.stats,
+    modules: { bridge, store, data, series, engine, exec, input, ui }
   };
-
-  let bootWaits = 0;
-  function boot() {
-    if (!PAGE.document.body) { setTimeout(boot, 60); return; }
-    if (!$('longBtn')) { if (++bootWaits < 100) setTimeout(boot, 150); return; }
-    buildUI();
-    log('量化辅助台已就绪 v1.3.0（漂移引擎 + 指标引擎）');
-    setInterval(() => {
-      try { step(); } catch (err) { log('循环异常：' + (err && err.message ? err.message : err)); }
-    }, LOOP_MS);
-    setInterval(() => { sweepModals(); }, SWEEP_MS);
-  }
-
-  if (PAGE.document.readyState === 'loading') {
-    PAGE.document.addEventListener('DOMContentLoaded', boot, { once: true });
-  } else {
-    boot();
-  }
 })();
