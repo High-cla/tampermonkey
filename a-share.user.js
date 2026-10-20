@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         大A 简单! · 做市量化台
 // @namespace    fx-quant/a-share
-// @version      3.6.0
-// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；凯利定仓 + 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储退避 + 移动端适配 + 遮挡补偿 + WS 退避重连 + token 落盘 + 通知弹窗自动关闭
+// @version      3.8.0
+// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；纯凯利定仓（无上限）+ 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储退避 + 移动端适配 + 遮挡补偿 + WS 退避重连 + token 落盘 + 通知弹窗自动关闭 + 杠杆可调
 // @match        https://www.bilibili.com/toy/suoha/*
 // @match        https://www.bilibilitoy.com/toy/suoha/*
 // @run-at       document-start
@@ -58,7 +58,10 @@
   const WS_RETRY_JITTER = 0.2;     // 重连抖动 ±20%，避免多客户端同步重连风暴
 
   const PHASE = Object.freeze({ idle: '空闲', bidding: '挂买中', asking: '挂卖中', closing: '平仓中' });
-  const DEFAULTS = Object.freeze({ lev: 5, margin: 500 });
+  const LEV_MIN = 1;              // 服务端下限
+  const LEV_MAX = 50;             // 服务端上限（做市 25s 持有期，50× 下 0.7% 逆行即触发 35% 止损）
+  // margin 无上限：仓位完全由凯利比例决定（avail × kelly，下限 MIN_MARGIN 兜底）
+  const DEFAULTS = Object.freeze({ lev: 5 });
 
   /* ================= 格式化（Intl 实例缓存） ================= */
   const NF2 = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
@@ -139,7 +142,11 @@
   const ui = { auto: false, logs: [], refs: null };
 
   const cfg = (() => {
-    try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(CFG_KEY) || '{}') }; } catch { return { ...DEFAULTS }; }
+    let raw;
+    try { raw = JSON.parse(localStorage.getItem(CFG_KEY) || '{}'); } catch { raw = {}; }
+    const merged = { ...DEFAULTS, ...raw };
+    merged.lev = clampInt(merged.lev, LEV_MIN, LEV_MAX, DEFAULTS.lev);
+    return merged;
   })();
 
   /* ================= 数学 ================= */
@@ -416,7 +423,9 @@
     const ref = refPrice(snap, pair);
     if (!inBand(price, ref)) { pushLog('挂买价 ' + price + ' 超出现价 ' + ref + ' 的 ±20%'); return reset(); }
     const avail = (snap.account && snap.account.available) || 0;
-    const margin = Math.max(MIN_MARGIN, Math.min(cfg.margin, avail * kelly()));
+    // 纯凯利：仓位 = 可用余额 × 凯利比例，不设上限。MIN_MARGIN 兜底防小额账户下不了单；
+    // 下一行的 avail < margin 检查覆盖「兜底后仍超过可用」的情况。
+    const margin = Math.max(MIN_MARGIN, avail * kelly());
     if (avail < margin) { pushLog('可用不足'); return reset(); }
     const r = await post('order', {
       stock: pair, side: 1, margin: round2(margin),
@@ -528,6 +537,15 @@
     }
   }
 
+  function clampInt(v, lo, hi, fallback) {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
+  }
+
+  function saveCfg() {
+    try { localStorage.setItem(CFG_KEY, JSON.stringify({ lev: cfg.lev })); } catch {}
+  }
+
   /* ================= 日志 ================= */
   function pushLog(msg) {
     const line = TF.format(new Date()) + '  ' + msg;
@@ -547,6 +565,9 @@
     '    <div><span>可用</span><b data-aq="cash">—</b></div>',
     '    <div><span>浮盈</span><b data-aq="float">—</b></div>',
     '    <div><span>凯利</span><b data-aq="kelly">—</b></div>',
+    '  </div>',
+    '  <div class="aq-row"><span>杠杆</span>',
+    '    <input class="aq-num" data-aq="lev" type="number" min="1" max="50" step="1">',
     '  </div>',
     '  <div class="aq-actions">',
     '    <button class="aq-btn" data-aq="auto">自动 关</button>',
@@ -577,6 +598,8 @@
     '#aq-panel .aq-btn{flex:1;background:rgba(120,200,180,.12);color:#cfe;border:1px solid rgba(120,200,180,.25);',
     'border-radius:6px;padding:4px 6px;font-size:11px;cursor:pointer}',
     '#aq-panel .aq-btn.on{background:rgba(90,220,150,.3);border-color:rgba(90,220,150,.6)}',
+    '#aq-panel .aq-num{width:64px;background:rgba(255,255,255,.06);color:#d8e4e0;border:1px solid rgba(120,200,180,.25);',
+    'border-radius:6px;padding:2px 6px;font:11px system-ui,sans-serif;text-align:right}',
     '#aq-panel .aq-pos{font-size:11px;opacity:.85}',
     '#aq-panel .aq-log{font-size:10px;opacity:.7;max-height:110px;overflow:auto;line-height:1.45}',
     // 移动端：贴底 + 安全区 + 高度上限，避免遮挡游戏底部按钮
@@ -618,6 +641,16 @@
     try { folded = localStorage.getItem(FOLD_KEY); } catch {}
     // 移动端首次访问默认折叠（只留标题条），用户手动展开后记住选择
     if (folded === '1' || (folded === null && isMobile())) root.classList.add('aq-fold');
+    const levInput = q('lev');
+    levInput.value = String(cfg.lev);
+    levInput.onchange = () => {
+      const v = clampInt(levInput.value, LEV_MIN, LEV_MAX, DEFAULTS.lev);
+      levInput.value = String(v);
+      if (v === cfg.lev) return;
+      cfg.lev = v;
+      saveCfg();
+      pushLog('杠杆 ' + v + '×');
+    };
     q('auto').onclick = () => {
       ui.auto = !ui.auto;
       q('auto').classList.toggle('on', ui.auto);
@@ -742,5 +775,5 @@
   else setTimeout(mount, 0);
   if (/[?&]aq_anon=1/.test(location.search)) setTimeout(useAnonymous, 800);
 
-  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, ensureToken, PAGE, planIdle, planBidding, planAsking, planClosing, refPrice, inBand, LIMIT_BAND, shiftTimers, cacheToken, cloud, dismissNotices };
+  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, ensureToken, PAGE, planIdle, planBidding, planAsking, planClosing, refPrice, inBand, LIMIT_BAND, shiftTimers, cacheToken, cloud, dismissNotices, cfg, saveCfg, clampInt, LEV_MIN, LEV_MAX };
 })();

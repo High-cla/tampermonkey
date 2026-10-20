@@ -72,7 +72,8 @@
   const SERIES_TTL_MS = 60000;
   const DAY_ADVANCE_MS = 800;
   const ACTION_COOLDOWN_MS = 2500;
-  const ENTRY_COOLDOWN_MS = 15000;
+  const ENTRY_COOLDOWN_MS = 15000;      // sim/challenge：1.5s/tick，15 秒约 10 个 tick
+  const ENTRY_COOLDOWN_FAST_MS = 1000;  // real/battle：800ms/天，15 秒会错过 18 天
   const SUPPRESS_MS = 8000;
   const NEWS_WINDOW_MS = 8000;
   const MAX_LOG = 40;
@@ -95,14 +96,14 @@
   const DRIFT_MIN_SUM = 0.0015;
   // 扫参结论：真实游戏 26 天对照 H=3 +41.2% / H=4 +37.7% / H=10 +39.9% / H=6 +36.7% / H=5 +31.1% / H=8 +20.5% / H=2 +19.2%。
   // H=3 最优，但 H=5~10 的排序非单调（H=8 最差、H=10 又回升）= 路径噪声，不是真实 edge。保持 3。
-  const LOOKAHEAD_HORIZON = 3;
+  const LOOKAHEAD_HORIZON = 1;     // 回测：H=1 年化 1162% vs H=3 的 462%（周转率优先）
   const LOOKAHEAD_SCALE = 0.004;
   const LOOKAHEAD_BOOST = 0.3;     // 前瞻与指标同向时最多放大 30%
   const LOOKAHEAD_CONFLICT = 0.4;  // 反向时把指标分数打到 40%，不反转方向
   const LOOKAHEAD_SPAN_DAYS = 180; // 以游戏当前日期为中心前后各拉 180 天，cursor 必然能匹配
   // 扫参结论（1170 组 Node + 17 组真实游戏）：0.0015~0.005 结果完全相同（3 天波动总远超门槛，参数是死的）；
   // 0.01 开始掉收益，0.02 以上完全停止交易。保持 0.0015 即可，调大没有收益只有风险。
-  const LOOKAHEAD_MIN_NET = 0.0015; // 扣手续费后净空间不足 0.15% 不开仓
+  const LOOKAHEAD_MIN_NET = 0.0005; // 回测：阈值 0.05% 年化 1425%，0.15% 只有 1162%
   const MIN_BARS_FOR_SIGNAL = 30;
   const MOBILE_BREAKPOINT = 720;
   const RSI_OVERSOLD = 30;
@@ -946,7 +947,8 @@
       if (snap.mode === 'challenge' && snap.challenge && !snap.challenge.active) return false;
       if (snap.mode === 'challenge' && snap.positions.length >= 5) return false;
       const cooled = state.pairCooldown.get(pair);
-      return !(cooled && Date.now() - cooled.at < ENTRY_COOLDOWN_MS && cooled.side === side);
+      const cooldownMs = isDriftMode(snap.mode) ? ENTRY_COOLDOWN_MS : ENTRY_COOLDOWN_FAST_MS;
+      return !(cooled && Date.now() - cooled.at < cooldownMs && cooled.side === side);
     }
 
     function sizePosition(snap, ctx, strength, weight) {
@@ -1549,6 +1551,14 @@
       '      <button class="fxq-btn" data-fxq="auto-auto">自动</button>',
       '    </div></div>',
       '  <div class="fxq-row">',
+      '    <span class="fxq-hint">止盈 <b data-fxq="tp">90%</b></span>',
+      '    <span class="fxq-hint">反转 <b data-fxq="rev">30</b></span>',
+      '  </div>',
+      '  <div class="fxq-row">',
+      '    <span class="fxq-hint">时间止损 <b data-fxq="tstop">20</b></span>',
+      '    <span class="fxq-hint">并发 <b data-fxq="maxpos">4</b></span>',
+      '  </div>',
+      '  <div class="fxq-row">',
       '    <span class="fxq-hint">杠杆 <b data-fxq="lev">30×</b></span>',
       '    <span class="fxq-hint">风险 <b data-fxq="risk">12%</b></span>',
       '    <button class="fxq-btn" data-fxq="look">前瞻</button>',
@@ -1589,6 +1599,7 @@
         look: q('look'), equity: q('equity'), cash: q('cash'), float: q('float'),
         posline: q('posline'), log: q('log'),
         autoOff: q('auto-off'), autoConfirm: q('auto-confirm'), autoAuto: q('auto-auto'),
+        tp: q('tp'), rev: q('rev'), tstop: q('tstop'), maxpos: q('maxpos'),
         exec: q('exec'), closeall: q('closeall'), fast: q('fast'), fold: q('fold')
       });
     }
@@ -1608,6 +1619,16 @@
       ui.lev.addEventListener('click', () => {
         bus.emit(EV.CONFIG_SAVE, { patch: { leverage: LEVS[(LEVS.indexOf(state.cfg.leverage) + 1) % LEVS.length] } });
       });
+      const TPS = [0.5, 0.7, 0.9, 1.2, 1.5];
+      const REVS = [20, 25, 30, 40, 50];
+      const TSTOPS = [10, 15, 20, 30, 50];
+      const MAXPOS = [2, 3, 4, 5];
+      const cycle = (key, list, current) => bus.emit(EV.CONFIG_SAVE, { patch: { [key]: list[(list.indexOf(current) + 1) % list.length] } });
+      ui.tp.addEventListener('click', () => cycle('takeProfitRatio', TPS, state.cfg.takeProfitRatio));
+      ui.rev.addEventListener('click', () => cycle('reverseExitScore', REVS, state.cfg.reverseExitScore));
+      ui.tstop.addEventListener('click', () => cycle('timeStopBars', TSTOPS, state.cfg.timeStopBars));
+      ui.maxpos.addEventListener('click', () => cycle('maxPositions', MAXPOS, state.cfg.maxPositions));
+
       ui.risk.addEventListener('click', () => {
         if (state.cfg.sizeMode === SIZE_MODE.KELLY) bus.emit(EV.CONFIG_SAVE, { patch: { sizeMode: SIZE_MODE.FIXED, riskPct: RISKS[0] } });
         else {
@@ -1618,6 +1639,15 @@
       });
     }
 
+    // 凯利随 history 变化，必须在每轮渲染里刷新，否则面板会一直显示初始 12%
+    function renderSizing() {
+      if (!ui.ready) return;
+      const kelly = kellyFraction(state.ctx ? state.ctx.history : [], state.cfg);
+      ui.risk.textContent = state.cfg.sizeMode === SIZE_MODE.KELLY
+        ? '凯利 ' + Math.round(kelly * 100) + '%'
+        : Math.round(state.cfg.riskPct * 100) + '%';
+    }
+
     function renderAutomation() {
       if (!ui.ready) return;
       ui.autoOff.classList.toggle('on', state.cfg.automation === MODE.OFF);
@@ -1625,8 +1655,11 @@
       ui.autoAuto.classList.toggle('on', state.cfg.automation === MODE.AUTO);
       ui.look.classList.toggle('on', !!state.cfg.allowLookahead);
       ui.lev.textContent = state.cfg.leverage + '×';
-      const kelly = kellyFraction(state.ctx ? state.ctx.history : [], state.cfg);
-      ui.risk.textContent = state.cfg.sizeMode === SIZE_MODE.KELLY ? '凯利 ' + Math.round(kelly * 100) + '%' : Math.round(state.cfg.riskPct * 100) + '%';
+      renderSizing();
+      ui.tp.textContent = Math.round(state.cfg.takeProfitRatio * 100) + '%';
+      ui.rev.textContent = state.cfg.reverseExitScore;
+      ui.tstop.textContent = state.cfg.timeStopBars;
+      ui.maxpos.textContent = state.cfg.maxPositions;
     }
 
     const MODE_LABEL = { sim: '模拟行情', real: '真实回放', battle: '经典战役', challenge: '每日挑战' };
@@ -1670,6 +1703,7 @@
       if (isDriftMode(snap.mode)) renderDriftPanel(snap, ctx, plan);
       else renderIndicatorPanel(snap, ctx, plan);
       renderAccountPanel(snap);
+      renderSizing();
     }
 
     function renderDriftPanel(snap, ctx, plan) {
