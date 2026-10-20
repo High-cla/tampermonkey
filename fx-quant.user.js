@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         FX 简单! · 量化辅助台
 // @namespace    https://www.bilibilitoy.com/toy/fx-simple
-// @version      2.1.0
-// @description  B站「FX 简单!」量化辅助：八模块事件驱动架构、漂移相位引擎、移动端适配
+// @version      2.2.0
+// @description  B站「FX 简单!」量化辅助：八模块事件驱动架构、漂移/前瞻/指标三引擎、移动端适配
 // @author       fxq
 // @match        https://www.bilibilitoy.com/toy/fx-simple/*
 // @run-at       document-start
-// @grant        unsafeWindow
+// @sandbox      raw
 // ==/UserScript==
 
 /* ============================================================================
@@ -41,7 +41,10 @@
 (() => {
   'use strict';
 
-  const PAGE = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+  // MAIN_WORLD（Chromium 上的 @sandbox MAIN_WORLD）下 window 就是页面 window，无需任何桥接；
+  // 沙盒模式（Firefox / 旧版 TM）才退回 unsafeWindow + <script> 注入兜底。
+  const IS_SANDBOX = typeof unsafeWindow !== 'undefined' && unsafeWindow !== window;
+  const PAGE = IS_SANDBOX ? unsafeWindow : window;
   if (PAGE.__FXQ_BOOTED__) return;
   PAGE.__FXQ_BOOTED__ = true;
 
@@ -90,11 +93,15 @@
   const DRIFT_MIN_BARS = 8;
   const DRIFT_MAX_BARS = 30;
   const DRIFT_MIN_SUM = 0.0015;
+  // 扫参结论：真实游戏 26 天对照 H=3 +41.2% / H=4 +37.7% / H=10 +39.9% / H=6 +36.7% / H=5 +31.1% / H=8 +20.5% / H=2 +19.2%。
+  // H=3 最优，但 H=5~10 的排序非单调（H=8 最差、H=10 又回升）= 路径噪声，不是真实 edge。保持 3。
   const LOOKAHEAD_HORIZON = 3;
   const LOOKAHEAD_SCALE = 0.004;
   const LOOKAHEAD_BOOST = 0.3;     // 前瞻与指标同向时最多放大 30%
   const LOOKAHEAD_CONFLICT = 0.4;  // 反向时把指标分数打到 40%，不反转方向
   const LOOKAHEAD_SPAN_DAYS = 180; // 以游戏当前日期为中心前后各拉 180 天，cursor 必然能匹配
+  // 扫参结论（1170 组 Node + 17 组真实游戏）：0.0015~0.005 结果完全相同（3 天波动总远超门槛，参数是死的）；
+  // 0.01 开始掉收益，0.02 以上完全停止交易。保持 0.0015 即可，调大没有收益只有风险。
   const LOOKAHEAD_MIN_NET = 0.0015; // 扣手续费后净空间不足 0.15% 不开仓
   const MIN_BARS_FOR_SIGNAL = 30;
   const MOBILE_BREAKPOINT = 720;
@@ -516,7 +523,7 @@
 
     function init() {
       installDirectBridge();
-      installScriptBridge();
+      if (IS_SANDBOX) installScriptBridge();   // 同 world 时不需要注入
       const announce = () => {
         via = Object.keys(tools).length || Object.keys(pageTools() || {}).length ? 'api' : 'dom';
         bus.emit(EV.BRIDGE_READY, { via, call, has, readSave });
@@ -1776,7 +1783,7 @@
         if (!PAGE.document.body) { setTimeout(boot, 60); return; }
         if (!$('longBtn')) { if (++waits < 100) setTimeout(boot, 150); return; }
         build();
-        log('量化辅助台已就绪 v2.1.0（八模块事件驱动）');
+        log('量化辅助台已就绪 v2.2.0（八模块 · MAIN_WORLD）');
       };
       if (PAGE.document.readyState === 'loading') PAGE.document.addEventListener('DOMContentLoaded', boot, { once: true });
       else boot();

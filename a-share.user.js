@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         大A 简单! · 做市量化台
 // @namespace    fx-quant/a-share
-// @version      3.0.0
-// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出，赚 spread；凯利定仓 + 限价止损 + 增量渲染
+// @version      3.3.0
+// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；凯利定仓 + 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储指数退避 + 移动端适配
 // @match        https://www.bilibili.com/toy/suoha/*
 // @match        https://www.bilibilitoy.com/toy/suoha/*
 // @run-at       document-start
-// @grant        unsafeWindow
+// @grant        none
 // ==/UserScript==
 
 (() => {
@@ -18,7 +18,7 @@
   /* ================= 常量 ================= */
   const WAIT_MS = 25000;          // 挂单存活期
   const GRACE_MS = 4000;          // 挂单后快照未回显的宽限
-  const WATCHDOG_MS = 15000;      // 单次 step 的硬上限（AbortController）
+  const WATCHDOG_MS = 25000;      // 单次 step 的硬上限（AbortController）
   const STOP_FALLBACK_MS = 3000;  // 止损限价转市价的等待
   const DEPTH_REF = 1000;         // pickPair 的深度基准（股）
   const KELLY_WINDOW = 40;
@@ -31,12 +31,24 @@
   const KELLY_MIN = 0.03, KELLY_MAX = 0.20;
   const BASE_FRAC = 0.08;
   const TICK_FALLBACK = 0.01;
-  const REQ_TIMEOUT_MS = 8000;
+  const REQ_TIMEOUT_MS = 20000;
   const CFG_KEY = 'ashare-mm-config-v1';
   const FOLD_KEY = 'ashare-mm-fold';
   const BACKEND = 'https://8.134.122.85/a-share/';
+  const CLOUD_KEY = 'a_share_online_session_v1';
+  const LOCAL_KEY = 'a-share-local-session-v1';
 
-  const PHASE = { idle: '空闲', bidding: '挂买中', asking: '挂卖中', closing: '平仓中' };
+  // 官方限流：云存储/排行榜由全 Toy 玩家共享额度，超限 SDK 抛 { type:'http_error', code:307044 }
+  // https://github.com/bilibili/toy → skills/toy/references/content-checklist.md §7
+  const CLOUD_BACKOFF_BASE = 1000;   // 首次退避
+  const CLOUD_BACKOFF_MAX = 60000;   // 退避上限
+  const CLOUD_FAIL_LIMIT = 5;        // 连续失败到此数后放弃云通道
+  const MOBILE_BREAKPOINT = 720;
+  // 服务端硬约束：限价必须在现价 ±20% 内（实测 400「限价需在现价上下 20%（至少一个价格档位）范围内。」）
+  const LIMIT_BAND = 0.2;
+
+  const PHASE = Object.freeze({ idle: '空闲', bidding: '挂买中', asking: '挂卖中', closing: '平仓中' });
+  const DEFAULTS = Object.freeze({ lev: 5, margin: 500 });
 
   /* ================= 格式化（Intl 实例缓存） ================= */
   const NF2 = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
@@ -86,13 +98,12 @@
     seq: 0,
   };
 
-  const stats = { history: [], lastTradeAt: 0 };
+  const stats = { history: [], lastTradeAt: 0, lastServerTime: 0 };
 
   const ui = { auto: false, logs: [], refs: null };
 
   const cfg = (() => {
-    const def = { lev: 5, margin: 500 };
-    try { return { ...def, ...JSON.parse(localStorage.getItem(CFG_KEY) || '{}') }; } catch { return def; }
+    try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(CFG_KEY) || '{}') }; } catch { return { ...DEFAULTS }; }
   })();
 
   /* ================= 数学 ================= */
@@ -115,8 +126,10 @@
   }
 
   /* ================= 桥接 ================= */
+  const PAGE = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+
   function initBridge() {
-    const Orig = window.WebSocket;
+    const Orig = PAGE.WebSocket;
     if (!Orig) return;
     function Patched(url, protocols) {
       const ws = protocols === undefined ? new Orig(url) : new Orig(url, protocols);
@@ -141,13 +154,53 @@
     }
     Patched.prototype = Orig.prototype;
     for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Patched[k] = Orig[k];
-    window.WebSocket = Patched;
+    PAGE.WebSocket = Patched;
+  }
+
+  // 云通道状态：指数退避 + 放弃标记。成功后 token 在会话期内不变，永不再调。
+  const cloud = { fails: 0, until: 0, dead: false };
+
+  async function readCloudToken() {
+    if (cloud.dead || Date.now() < cloud.until) return '';
+    const toy = PAGE.toy;
+    if (!toy) return '';
+    let ok = false;
+    try {
+      ok = typeof toy.isSupport === 'function'
+        ? await toy.isSupport('getCloudStorage')
+        : typeof toy.getCloudStorage === 'function';
+    } catch { ok = false; }
+    if (!ok) { cloud.dead = true; return ''; }
+    try {
+      const d = await toy.getCloudStorage([CLOUD_KEY]);
+      const t = d && d[CLOUD_KEY];
+      if (t) { cloud.fails = 0; cloud.until = 0; return t; }
+      return '';
+    } catch (e) {
+      cloud.fails++;
+      const delay = Math.min(CLOUD_BACKOFF_MAX, CLOUD_BACKOFF_BASE * 2 ** (cloud.fails - 1));
+      cloud.until = Date.now() + delay;
+      if (e && e.code === 307044) pushLog('云存储限流，' + Math.round(delay / 1000) + 's 后重试');
+      else if (cloud.fails >= CLOUD_FAIL_LIMIT) { cloud.dead = true; pushLog('云存储不可用，改用本地 token'); }
+      return '';
+    }
+  }
+
+  async function ensureToken() {
+    if (conn.token) return true;
+    const t = await readCloudToken();
+    if (t) { conn.token = t; return true; }
+    try {
+      const lt = localStorage.getItem(LOCAL_KEY);
+      if (lt) { conn.token = lt; return true; }
+    } catch {}
+    return false;
   }
 
   let inflight = null;
 
   async function post(path, body = {}, auth = true) {
-    const base = new URL(window.A_SHARE_BACKEND_URL || BACKEND);
+    const base = new URL('api/', PAGE.A_SHARE_BACKEND_URL || BACKEND);
     const headers = { 'Content-Type': 'application/json', 'X-A-Share-Action': '1' };
     if (auth && conn.token) headers.Authorization = 'Bearer ' + conn.token;
     const signals = [AbortSignal.timeout(REQ_TIMEOUT_MS)];
@@ -183,6 +236,8 @@
 
   bus.on('data:snapshot', snap => {
     if (!ui.refs) mount();
+    if (snap.serverTime && snap.serverTime === stats.lastServerTime) return;
+    stats.lastServerTime = snap.serverTime || 0;
     conn.snap = snap;
     indexStocks(snap);
     const fill = detectFill(snap);
@@ -219,6 +274,16 @@
   function firstPos(snap) {
     const ps = (snap.account && snap.account.positions) || [];
     return ps[0] || null;
+  }
+
+  // 服务端现价（markets[stock].price）——限价带以它为基准，不是 bid0/ask0
+  function refPrice(snap, stock) {
+    const m = snap.markets && snap.markets[stock];
+    return (m && m.price) || 0;
+  }
+
+  function inBand(price, ref) {
+    return ref > 0 && Math.abs(price / ref - 1) <= LIMIT_BAND;
   }
 
   function planIdle(snap) {
@@ -278,10 +343,13 @@
   }
 
   async function placeBid(snap, pair) {
+    if (!(await ensureToken())) { pushLog('无 token，跳过下单'); return reset(); }
     const bk = snap.orderBooks[pair];
     const bid = bk && bk.bids && bk.bids[0];
     if (!bid) return reset();
     const price = round2(bid.price + conn.tickOf(pair));
+    const ref = refPrice(snap, pair);
+    if (!inBand(price, ref)) { pushLog('挂买价 ' + price + ' 超出现价 ' + ref + ' 的 ±20%'); return reset(); }
     const avail = (snap.account && snap.account.available) || 0;
     const margin = Math.max(MIN_MARGIN, Math.min(cfg.margin, avail * kelly()));
     if (avail < margin) { pushLog('可用不足'); return reset(); }
@@ -299,10 +367,13 @@
   }
 
   async function placeAsk(snap, pos) {
+    if (!(await ensureToken())) { pushLog('无 token，跳过平仓'); return reset(); }
     const bk = snap.orderBooks[pos.stock];
     const ask = bk && bk.asks && bk.asks[0];
     if (!ask) return reset();
     const price = round2(ask.price - conn.tickOf(pos.stock));
+    const ref = refPrice(snap, pos.stock);
+    if (!inBand(price, ref)) { pushLog('挂卖价 ' + price + ' 超出现价 ' + ref + ' 的 ±20%'); return reset(); }
     const r = await post('close', { id: pos.id, orderType: 'limit', limitPrice: price });
     if (!r) return reset();
     mm.phase = 'asking';
@@ -314,10 +385,13 @@
   }
 
   async function closeLimit(snap, pos, why) {
+    if (!(await ensureToken())) { pushLog('无 token，跳过止损'); return reset(); }
     const bk = snap.orderBooks[pos.stock];
     const bid = bk && bk.bids && bk.bids[0];
     if (!bid) return closeMarket(pos, why);
     const price = round2(bid.price);
+    const ref = refPrice(snap, pos.stock);
+    if (!inBand(price, ref)) { pushLog('止损价 ' + price + ' 超出现价 ' + ref + ' 的 ±20%，改市价'); return closeMarket(pos, why); }
     try {
       await post('close', { id: pos.id, orderType: 'limit', limitPrice: price });
       mm.phase = 'closing';
@@ -440,10 +514,20 @@
     '#aq-panel .aq-btn.on{background:rgba(90,220,150,.3);border-color:rgba(90,220,150,.6)}',
     '#aq-panel .aq-pos{font-size:11px;opacity:.85}',
     '#aq-panel .aq-log{font-size:10px;opacity:.7;max-height:110px;overflow:auto;line-height:1.45}',
+    // 移动端：贴底 + 安全区 + 高度上限，避免遮挡游戏底部按钮
+    '@media (max-width:' + MOBILE_BREAKPOINT + 'px){',
+    '#aq-panel{right:8px;left:8px;top:auto;bottom:calc(8px + env(safe-area-inset-bottom,0px));width:auto;',
+    'max-height:calc(100dvh - 24px);display:flex;flex-direction:column}',
+    '#aq-panel .aq-body{overflow:auto}',
+    '}',
   ].join('');
 
+  const mobileQuery = PAGE.matchMedia ? PAGE.matchMedia('(max-width:' + MOBILE_BREAKPOINT + 'px)') : null;
+  const isMobile = () => (mobileQuery ? mobileQuery.matches : PAGE.innerWidth <= MOBILE_BREAKPOINT);
+
   function mount() {
-    if (ui.refs || !document.body || !document.head) return;
+    if (ui.refs) return;
+    if (!document.body || !document.head) { setTimeout(mount, 100); return; }
     const st = document.createElement('style');
     st.textContent = CSS;
     document.head.appendChild(st);
@@ -457,11 +541,18 @@
       dot: q('dot'), conn: q('conn'), equity: q('equity'), phase: q('phase'),
       cash: q('cash'), float: q('float'), kelly: q('kelly'), pos: q('pos'), log: q('log'),
     };
+    const syncFoldBtn = () => { q('fold').textContent = root.classList.contains('aq-fold') ? '+' : '—'; };
     q('fold').onclick = () => {
       const folded = root.classList.toggle('aq-fold');
       try { localStorage.setItem(FOLD_KEY, folded ? '1' : '0'); } catch {}
+      syncFoldBtn();
+      render();
     };
-    try { if (localStorage.getItem(FOLD_KEY) === '1') root.classList.add('aq-fold'); } catch {}
+    syncFoldBtn();
+    let folded = null;
+    try { folded = localStorage.getItem(FOLD_KEY); } catch {}
+    // 移动端首次访问默认折叠（只留标题条），用户手动展开后记住选择
+    if (folded === '1' || (folded === null && isMobile())) root.classList.add('aq-fold');
     q('auto').onclick = () => {
       ui.auto = !ui.auto;
       q('auto').classList.toggle('on', ui.auto);
@@ -528,7 +619,7 @@
 
   function connectAnonWs() {
     if (anonWs) { try { anonWs.close(); } catch {} }
-    const base = new URL(window.A_SHARE_BACKEND_URL || BACKEND);
+    const base = new URL(PAGE.A_SHARE_BACKEND_URL || BACKEND);
     const wsUrl = new URL('ws', base);
     wsUrl.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(wsUrl);
@@ -543,11 +634,21 @@
     ws.onerror = () => {};
   }
 
+  /* ================= 自建 WS（不依赖游戏 socket） ================= */
+  async function bootstrap() {
+    for (let i = 0; i < 40 && !conn.token; i++) await new Promise(r => setTimeout(r, 500));
+    if (!conn.token) await ensureToken();
+    if (!conn.token) { pushLog('无 token：请确认已登录 B 站并进入游戏'); return; }
+    pushLog('token 就绪，连接行情');
+    connectAnonWs();
+  }
+
   /* ================= 启动 ================= */
   initBridge();
+  setTimeout(bootstrap, 1500);
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);
   else setTimeout(mount, 0);
   if (/[?&]aq_anon=1/.test(location.search)) setTimeout(useAnonymous, 800);
 
-  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, planIdle, planBidding, planAsking, planClosing };
+  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, ensureToken, PAGE, planIdle, planBidding, planAsking, planClosing, refPrice, inBand, LIMIT_BAND };
 })();
