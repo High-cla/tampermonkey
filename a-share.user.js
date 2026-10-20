@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         大A 简单! · 做市量化台
 // @namespace    fx-quant/a-share
-// @version      3.3.0
-// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；凯利定仓 + 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储指数退避 + 移动端适配
+// @version      3.5.0
+// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；凯利定仓 + 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储退避 + 移动端适配 + 遮挡补偿 + WS 退避重连 + token 落盘
 // @match        https://www.bilibili.com/toy/suoha/*
 // @match        https://www.bilibilitoy.com/toy/suoha/*
 // @run-at       document-start
@@ -46,6 +46,10 @@
   const MOBILE_BREAKPOINT = 720;
   // 服务端硬约束：限价必须在现价 ±20% 内（实测 400「限价需在现价上下 20%（至少一个价格档位）范围内。」）
   const LIMIT_BAND = 0.2;
+  const OCCLUSION_MIN_GAP = 5000;  // 遮挡补偿阈值：更短的切换不改状态
+  const WS_RETRY_BASE = 1000;      // WS 重连退避起点
+  const WS_RETRY_MAX = 30000;      // WS 重连退避上限
+  const WS_RETRY_JITTER = 0.2;     // 重连抖动 ±20%，避免多客户端同步重连风暴
 
   const PHASE = Object.freeze({ idle: '空闲', bidding: '挂买中', asking: '挂卖中', closing: '平仓中' });
   const DEFAULTS = Object.freeze({ lev: 5, margin: 500 });
@@ -87,6 +91,13 @@
     nameOf: id => (conn.stocks.get(id) || {}).name || id,
   };
 
+  // token 落盘：云通道限流时 localStorage 是唯一兜底。三个入口（hook 拦截 / 云读取 / 匿名建号）都走这里。
+  function cacheToken(t) {
+    if (!t || t === conn.token) return;
+    conn.token = t;
+    try { localStorage.setItem(LOCAL_KEY, t); } catch {}
+  }
+
   const mm = {
     phase: 'idle',
     pair: null,
@@ -97,6 +108,25 @@
     stopAt: 0,
     seq: 0,
   };
+
+  // 遮挡补偿：Windows 上 Edge 默认 CalculateNativeWinOcclusion，标签页被完全遮挡时
+  // 渲染进程挂起（定时器/WS/fetch 全停），但 Date.now() 照走 → 恢复后所有 deadline 瞬间过期。
+  // 做法是把仍在进行中的计时器顺延遮挡时长，而不是重置（重置会让 Date.now() > 0 恒真）。
+  let hiddenSince = 0;
+
+  function shiftTimers(gap) {
+    if (gap < OCCLUSION_MIN_GAP) return false;
+    for (const k of ['deadline', 'grace', 'stopAt']) if (mm[k]) mm[k] += gap;
+    return true;
+  }
+
+  function onVisibilityChange() {
+    if (document.hidden) { hiddenSince = Date.now(); return; }
+    if (!hiddenSince) return;
+    const gap = Date.now() - hiddenSince;
+    hiddenSince = 0;
+    if (shiftTimers(gap)) pushLog('遮挡 ' + Math.round(gap / 1000) + 's，计时器顺延');
+  }
 
   const stats = { history: [], lastTradeAt: 0, lastServerTime: 0 };
 
@@ -139,12 +169,14 @@
           if (!conn.token) {
             try {
               const m = JSON.parse(data);
-              if (m && typeof m.sessionToken === 'string' && m.sessionToken) conn.token = m.sessionToken;
+              if (m && typeof m.sessionToken === 'string' && m.sessionToken) cacheToken(m.sessionToken);
             } catch {}
           }
           return send(data);
         };
         ws.addEventListener('message', ev => {
+          // 自建 WS 已接管行情后，游戏 socket 的每帧 JSON.parse 是纯浪费
+          if (conn.token && conn.snap) return;
           let d;
           try { d = JSON.parse(ev.data); } catch { return; }
           if (d && d.type === 'snapshot') bus.emit('data:snapshot', d);
@@ -158,7 +190,7 @@
   }
 
   // 云通道状态：指数退避 + 放弃标记。成功后 token 在会话期内不变，永不再调。
-  const cloud = { fails: 0, until: 0, dead: false };
+  const cloud = { fails: 0, rateFails: 0, until: 0, dead: false };
 
   async function readCloudToken() {
     if (cloud.dead || Date.now() < cloud.until) return '';
@@ -174,14 +206,22 @@
     try {
       const d = await toy.getCloudStorage([CLOUD_KEY]);
       const t = d && d[CLOUD_KEY];
-      if (t) { cloud.fails = 0; cloud.until = 0; return t; }
+      if (t) { cloud.fails = 0; cloud.rateFails = 0; cloud.until = 0; return t; }
       return '';
     } catch (e) {
+      // 307044 是共享额度触发的正常限流（官方定性），只退避不放弃；
+      // 用独立计数器，避免限流把 fails 推到阈值后在下一个无关错误上误判永久失效。
+      if (e && e.code === 307044) {
+        cloud.rateFails++;
+        const delay = Math.min(CLOUD_BACKOFF_MAX, CLOUD_BACKOFF_BASE * 2 ** (cloud.rateFails - 1));
+        cloud.until = Date.now() + delay;
+        pushLog('云存储限流，' + Math.round(delay / 1000) + 's 后重试');
+        return '';
+      }
       cloud.fails++;
       const delay = Math.min(CLOUD_BACKOFF_MAX, CLOUD_BACKOFF_BASE * 2 ** (cloud.fails - 1));
       cloud.until = Date.now() + delay;
-      if (e && e.code === 307044) pushLog('云存储限流，' + Math.round(delay / 1000) + 's 后重试');
-      else if (cloud.fails >= CLOUD_FAIL_LIMIT) { cloud.dead = true; pushLog('云存储不可用，改用本地 token'); }
+      if (cloud.fails >= CLOUD_FAIL_LIMIT) { cloud.dead = true; pushLog('云存储不可用，改用本地 token'); }
       return '';
     }
   }
@@ -189,7 +229,7 @@
   async function ensureToken() {
     if (conn.token) return true;
     const t = await readCloudToken();
-    if (t) { conn.token = t; return true; }
+    if (t) { cacheToken(t); return true; }
     try {
       const lt = localStorage.getItem(LOCAL_KEY);
       if (lt) { conn.token = lt; return true; }
@@ -286,8 +326,14 @@
     return ref > 0 && Math.abs(price / ref - 1) <= LIMIT_BAND;
   }
 
+  let lastPosCount = 0;
+
   function planIdle(snap) {
-    const pos = firstPos(snap);
+    const ps = (snap.account && snap.account.positions) || [];
+    // 自动模式只管理第一个持仓；多仓时给出一次警告（数量变化才打，避免刷屏）
+    if (ps.length > 1 && ps.length !== lastPosCount) pushLog('警告：' + ps.length + ' 个持仓，自动模式只管理第一个');
+    lastPosCount = ps.length;
+    const pos = ps[0] || null;
     if (pos) return { type: 'ask', pos };
     const orders = (snap.account && snap.account.orders) || [];
     for (let i = 0; i < orders.length; i++) if (orders[i].status === 'open') return { type: 'none' };
@@ -603,13 +649,16 @@
 
   /* ================= 独立账户（测试用） ================= */
   let anonWs = null;
+  let wsRetry = 0;
+  let wsConnecting = false;
+  let wsTimer = null;
 
   async function useAnonymous() {
     try {
       if (!conn.token) {
         const d = await post('session', {}, false);
         if (!d || !d.sessionToken) throw new Error('无 token');
-        conn.token = d.sessionToken;
+        cacheToken(d.sessionToken);
         pushLog('独立账户 ' + ((d.account && d.account.nickname) || ''));
         bus.emit('data:snapshot', d);
       }
@@ -618,19 +667,42 @@
   }
 
   function connectAnonWs() {
-    if (anonWs) { try { anonWs.close(); } catch {} }
-    const base = new URL(PAGE.A_SHARE_BACKEND_URL || BACKEND);
-    const wsUrl = new URL('ws', base);
-    wsUrl.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(wsUrl);
+    if (wsConnecting) return;
+    wsConnecting = true;
+    clearTimeout(wsTimer);
+    if (anonWs) { try { anonWs.close(); } catch {} anonWs = null; }
+    let ws;
+    try {
+      const base = new URL(PAGE.A_SHARE_BACKEND_URL || BACKEND);
+      const wsUrl = new URL('ws', base);
+      wsUrl.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(wsUrl);
+    } catch (e) {
+      wsConnecting = false;
+      pushLog('行情连接失败: ' + e.message);
+      return;
+    }
     anonWs = ws;
-    ws.onopen = () => ws.send(JSON.stringify({ sessionToken: conn.token }));
+    ws.onopen = () => {
+      wsConnecting = false;
+      wsRetry = 0;
+      ws.send(JSON.stringify({ sessionToken: conn.token }));
+    };
     ws.onmessage = ev => {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m && m.type === 'snapshot') bus.emit('data:snapshot', m);
     };
-    ws.onclose = () => setTimeout(connectAnonWs, 3000);
+    ws.onclose = () => {
+      if (anonWs !== ws) return;   // 已被新连接取代，旧连接的 onclose 不应再触发重连
+      anonWs = null;
+      wsConnecting = false;
+      const baseDelay = Math.min(WS_RETRY_MAX, WS_RETRY_BASE * 2 ** wsRetry);
+      wsRetry = Math.min(wsRetry + 1, 6);
+      const jitter = baseDelay * WS_RETRY_JITTER * (Math.random() * 2 - 1);
+      clearTimeout(wsTimer);
+      wsTimer = setTimeout(connectAnonWs, baseDelay + jitter);
+    };
     ws.onerror = () => {};
   }
 
@@ -645,10 +717,11 @@
 
   /* ================= 启动 ================= */
   initBridge();
+  document.addEventListener('visibilitychange', onVisibilityChange);
   setTimeout(bootstrap, 1500);
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);
   else setTimeout(mount, 0);
   if (/[?&]aq_anon=1/.test(location.search)) setTimeout(useAnonymous, 800);
 
-  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, ensureToken, PAGE, planIdle, planBidding, planAsking, planClosing, refPrice, inBand, LIMIT_BAND };
+  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, ensureToken, PAGE, planIdle, planBidding, planAsking, planClosing, refPrice, inBand, LIMIT_BAND, shiftTimers, cacheToken, cloud };
 })();
