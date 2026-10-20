@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         大A 简单! · 做市量化台
 // @namespace    fx-quant/a-share
-// @version      3.5.0
-// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；凯利定仓 + 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储退避 + 移动端适配 + 遮挡补偿 + WS 退避重连 + token 落盘
+// @version      3.6.0
+// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；凯利定仓 + 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储退避 + 移动端适配 + 遮挡补偿 + WS 退避重连 + token 落盘 + 通知弹窗自动关闭
 // @match        https://www.bilibili.com/toy/suoha/*
 // @match        https://www.bilibilitoy.com/toy/suoha/*
 // @run-at       document-start
@@ -28,6 +28,12 @@
   const LOG_SHOW = 14;
   const MIN_MARGIN = 20;
   const STOP_RISK = 0.35;
+  // 通知类弹窗：游戏用 <dialog>.showModal() 弹出，会让页面其余元素 inert 且
+  // ::backdrop 覆盖 top layer —— 脚本面板的按钮因此点不动、面板被遮住。
+  // 只关 eventDialog（每笔平仓都弹）与 welcomeDialog（首次访问引导）。
+  // 用户主动操作的 resetDialog / closeLimitDialog / settingsDialog / helpDialog
+  // 与需要用户处理的 loginDialog 一律不碰。
+  const WELCOME_KEY = 'a-share-welcome-v1';   // 与游戏 app.js:14 一致
   const KELLY_MIN = 0.03, KELLY_MAX = 0.20;
   const BASE_FRAC = 0.08;
   const TICK_FALLBACK = 0.01;
@@ -276,6 +282,7 @@
 
   bus.on('data:snapshot', snap => {
     if (!ui.refs) mount();
+    dismissNotices();   // 放在去重之前：重复快照也要关掉新弹的窗
     if (snap.serverTime && snap.serverTime === stats.lastServerTime) return;
     stats.lastServerTime = snap.serverTime || 0;
     conn.snap = snap;
@@ -285,6 +292,18 @@
     step(snap);
     render();
   });
+
+  // 关掉通知类弹窗。快照驱动（约 1.18 Hz），成交后最多延迟一个快照间隔。
+  function dismissNotices() {
+    const ev = document.getElementById('eventDialog');
+    if (ev && ev.open) ev.close();
+    const wel = document.getElementById('welcomeDialog');
+    if (wel && wel.open) {
+      wel.close();
+      // 等价于点「开始交易」；不设的话每次 init() 都会重弹（app.js:145）
+      try { localStorage.setItem(WELCOME_KEY, '1'); } catch {}
+    }
+  }
 
   /* ================= 状态机（纯规划 + 外层执行） ================= */
   let busy = false;
@@ -723,5 +742,5 @@
   else setTimeout(mount, 0);
   if (/[?&]aq_anon=1/.test(location.search)) setTimeout(useAnonymous, 800);
 
-  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, ensureToken, PAGE, planIdle, planBidding, planAsking, planClosing, refPrice, inBand, LIMIT_BAND, shiftTimers, cacheToken, cloud };
+  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, ensureToken, PAGE, planIdle, planBidding, planAsking, planClosing, refPrice, inBand, LIMIT_BAND, shiftTimers, cacheToken, cloud, dismissNotices };
 })();
