@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FX 简单! · 量化辅助台
 // @namespace    https://www.bilibilitoy.com/toy/fx-simple
-// @version      2.2.0
+// @version      2.4.0
 // @description  B站「FX 简单!」量化辅助：八模块事件驱动架构、漂移/前瞻/指标三引擎、移动端适配
 // @author       fxq
 // @match        https://www.bilibilitoy.com/toy/fx-simple/*
@@ -262,9 +262,17 @@
     return { mid: mean, upper: mean + mult * sd, lower: mean - mult * sd };
   }
 
+  // 回放序列同时带历史与未来：指标只允许读 cursor 及之前，future 仅供前瞻引擎
+  function historyView(series) {
+    if (!series || !Array.isArray(series.prices)) return null;
+    const end = series.cursor >= 0 ? Math.min(series.cursor + 1, series.prices.length) : series.prices.length;
+    return { prices: series.prices.slice(0, end), candles: (series.candles || []).slice(0, end) };
+  }
+
   function computeIndicators(series, pair) {
-    if (!series || !series.prices || series.prices.length < MIN_BARS_FOR_SIGNAL) return null;
-    const prices = series.prices;
+    const view = historyView(series);
+    if (!view || view.prices.length < MIN_BARS_FOR_SIGNAL) return null;
+    const prices = view.prices;
     const last = prices.at(-1);
     const ema12 = emaSeries(prices, IND.EMA_FAST);
     const ema26 = emaSeries(prices, IND.EMA_SLOW);
@@ -274,7 +282,7 @@
     const macdSignal = emaSeries(macdLine.slice(-IND.MACD_WINDOW), IND.MACD_SIGNAL);
     const macdHist = macdLine.at(-1) - macdSignal.at(-1);
     const rsi14 = rsiLast(prices, IND.RSI);
-    const atr14 = atrOf(series.candles, IND.ATR);
+    const atr14 = atrOf(view.candles, IND.ATR);
     const boll = bollinger(prices, IND.BOLL, IND.BOLL_MULT);
     const roc10 = prices.length > IND.ROC ? (last / prices[prices.length - (IND.ROC + 1)] - 1) : 0;
     const atrPct = atr14 && last ? atr14 / last : 0;
@@ -504,7 +512,12 @@
       const tool = toolFor(name);
       if (!tool) return { status: STATUS.MISSING };
       try {
-        return { status: STATUS.OK, value: tool.execute(args || {}) };
+        const value = tool.execute(args || {});
+        // 原生 WebMCP 的 execute 返回 Promise：同步链路等不到结果，必须明确失败而不是把 Promise 当数据
+        if (value && typeof value.then === 'function') {
+          return { status: STATUS.FAILED, error: new Error('工具 ' + name + ' 返回 Promise，同步通道不支持') };
+        }
+        return { status: STATUS.OK, value };
       } catch (err) {
         return { status: STATUS.FAILED, error: err };
       }
@@ -529,11 +542,15 @@
         via = Object.keys(tools).length || Object.keys(pageTools() || {}).length ? 'api' : 'dom';
         bus.emit(EV.BRIDGE_READY, { via, call, has, readSave });
       };
-      if (PAGE.document.readyState === 'complete') setTimeout(announce, 0);
+      const timers = [];
+      if (PAGE.document.readyState === 'complete') timers.push(setTimeout(announce, 0));
       else PAGE.addEventListener('load', announce, { once: true });
-      setTimeout(announce, REATTACH_MS);
+      timers.push(setTimeout(announce, REATTACH_MS));
       return {
-        dispose() {},
+        dispose() {
+          for (const t of timers) clearTimeout(t);
+          PAGE.removeEventListener('load', announce);
+        },
         debug: {
           get tools() { return tools; },
           setTools(next) { for (const k of Object.keys(tools)) delete tools[k]; if (next) Object.assign(tools, next); },
@@ -566,7 +583,7 @@
         if (debugLog.length >= 20) debugLog.shift();
         debugLog.push(msg);
       });
-      bus.emit(EV.CONFIG_CHANGED, { cfg });
+      // 初始广播交给引导层：此处 emit 时 data/engine/exec/ui 尚未订阅，事件会丢
       return { dispose() {}, debug: { get cfg() { return cfg; }, debugLog } };
     }
 
@@ -742,7 +759,8 @@
       historyCache: new Map(),
       seriesCache: new Map(),
       indCache: new Map(),
-      tickAt: Date.now()
+      tickAt: Date.now(),
+      abort: new AbortController()
     };
 
     const log = msg => bus.emit(EV.LOG, { msg });
@@ -796,7 +814,7 @@
       const key = start + '~' + end;
       if (state.historyCache.has(key)) return state.historyCache.get(key);
       const url = 'https://api.frankfurter.dev/v1/' + start + '..' + end + '?base=EUR&symbols=' + FX_SYMBOLS;
-      const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+      const res = await fetch(url, { signal: AbortSignal.any([AbortSignal.timeout(20000), state.abort.signal]) });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const items = parseFrankfurter(await res.json());
       if (items.length < 5) throw new Error('历史数据不足');
@@ -849,8 +867,10 @@
     // 三元组比较替代字符串键，省掉每轮 7 次字符串拼接
     function cachedIndicators(series, pair, mode) {
       if (!series) return null;
-      const n = series.prices.length;
-      const last = series.prices[n - 1];
+      const view = historyView(series);
+      if (!view || !view.prices.length) return null;
+      const n = view.prices.length;
+      const last = view.prices[n - 1];
       const cursor = series.cursor ?? -1;
       const key = mode + '|' + pair;
       const hit = state.indCache.get(key);
@@ -904,7 +924,7 @@
       bus.on(EV.DATA_BAR, ({ at }) => { state.tickAt = at; });
       bus.on(EV.DATA_SNAPSHOT, onSnapshot);
       return {
-        dispose() {},
+        dispose() { state.abort.abort(); },
         debug: { getSeries, buildContext, state, historyFor }
       };
     }
@@ -919,6 +939,9 @@
       cfg: Object.assign({}, DEFAULTS),
       barCount: 0,
       tickAt: Date.now(),
+      snap: null,
+      managed: new Set(),      // 受管持仓 id：只有脚本开出的仓位才自动退出
+      warnedIds: new Set(),    // 缺少保证金数据的持仓只告警一次
       entryBars: new Map(),
       exitBars: new Map(),
       stopRatio: new Map(),
@@ -970,11 +993,22 @@
       for (const [ccy, delta] of [[base, notional * side], [quote, -notional * side]]) {
         const cur = map.get(ccy) || 0;
         if (Math.abs(cur + delta) <= cap) continue;
-        if (cur === 0 || Math.sign(cur) !== Math.sign(delta)) continue;
+        // 反向持仓降低敞口，放行；同向（含从零起步）按剩余额度等比缩减
+        if (cur !== 0 && Math.sign(cur) !== Math.sign(delta)) continue;
         const allowed = Math.max(0, cap - Math.abs(cur));
         if (Math.abs(delta) > 0) scale = Math.min(scale, allowed / Math.abs(delta));
       }
       return clamp(scale, 0, 1);
+    }
+
+    // 所有引擎共用一道敞口闸：首仓、同向加仓、反向对冲都走这里
+    function applyExposure(snap, plan) {
+      const scale = exposureScale(snap, plan.pair, plan.side, plan.margin, plan.leverage);
+      if (scale >= 1) return plan;
+      const margin = Math.floor(plan.margin * scale);
+      const floor = Math.max(MIN_MARGIN, Math.round((finite(snap.equity) ? snap.equity : snap.cash) * MIN_POSITION_RATIO));
+      if (margin < floor) return null;
+      return { ...plan, margin, note: plan.note + ' · 敞口' + Math.round(scale * 100) + '%' };
     }
 
     function activeNewsBias() {
@@ -994,17 +1028,12 @@
           note += aligned ? ' · 新闻顺风' : ' · 新闻逆风';
         }
         const strength = clamp(Math.abs(sig.value) / (DRIFT_MIN_SUM * 3), 0.5, 1);
-        let margin = sizePosition(snap, ctx, strength, weight);
+        const margin = sizePosition(snap, ctx, strength, weight);
         if (!margin) continue;
-        const scale = exposureScale(snap, sig.pair, sig.side, margin, state.cfg.leverage);
-        if (scale < 1) {
-          margin = Math.floor(margin * scale);
-          const floor = Math.max(MIN_MARGIN, Math.round((finite(snap.equity) ? snap.equity : snap.cash) * MIN_POSITION_RATIO));
-          if (margin < floor) continue;
-          note += ' · 敞口' + Math.round(scale * 100) + '%';
-        }
+        const capped = applyExposure(snap, { pair: sig.pair, side: sig.side, margin, leverage: state.cfg.leverage, note });
+        if (!capped) continue;
         const stopRatio = clamp(0.25 + Math.abs(sig.value) / DRIFT_MIN_SUM * 0.05, STOP_MIN, STOP_MAX);
-        return { pair: sig.pair, side: sig.side, margin, leverage: state.cfg.leverage, horizon: sig.horizon, score: sig.value * 10000, stopRatio, note };
+        return { ...capped, horizon: sig.horizon, score: sig.value * 10000, stopRatio };
       }
       return null;
     }
@@ -1047,12 +1076,12 @@
       if (!guardNewPosition(snap, best.pair, side)) return null;
       const margin = sizePosition(snap, ctx, clamp(best.net / LOOKAHEAD_SCALE, 0.4, 1), 1);
       if (!margin) return null;
-      return {
+      return applyExposure(snap, {
         pair: best.pair, side, margin, leverage: state.cfg.leverage,
         score: best.bias * 10000, stopRatio: STOP_RATIO,
         note: ' · 前瞻' + (best.bias >= 0 ? '+' : '') + (best.bias * 100).toFixed(2) + '% · 净' + (best.net * 100).toFixed(2) + '%',
         horizon: LOOKAHEAD_HORIZON
-      };
+      });
     }
 
     function planIndicator(snap, ctx) {
@@ -1066,7 +1095,8 @@
         if (!guardNewPosition(snap, ind.pair, side)) continue;
         const margin = sizePosition(snap, ctx, clamp(Math.abs(score) / 100, 0.4, 1), 1);
         if (!margin) continue;
-        return { pair: ind.pair, side, margin, leverage: state.cfg.leverage, score, stopRatio: STOP_RATIO, note, horizon: fused ? LOOKAHEAD_HORIZON : undefined };
+        const capped = applyExposure(snap, { pair: ind.pair, side, margin, leverage: state.cfg.leverage, score, stopRatio: STOP_RATIO, note, horizon: fused ? LOOKAHEAD_HORIZON : undefined });
+        if (capped) return capped;
       }
       return null;
     }
@@ -1075,8 +1105,15 @@
       const exits = [];
       const driftMode = isDriftMode(snap.mode);
       for (const pos of snap.positions) {
+        if (!state.managed.has(pos.id)) continue;   // 手动仓位不自动处置，需显式接管
         if (!state.entryBars.has(pos.id)) state.entryBars.set(pos.id, state.barCount);
-        if (!finite(pos.margin) || pos.margin <= 0) continue;
+        if (!finite(pos.margin) || pos.margin <= 0) {
+          if (!state.warnedIds.has(pos.id)) {
+            state.warnedIds.add(pos.id);
+            bus.emit(EV.LOG, { msg: pos.pair + ' 缺少保证金数据，自动风控跳过（DOM 通道限制）' });
+          }
+          continue;
+        }
         const lossRatio = -pos.pnl / pos.margin;
         const stop = state.stopRatio.get(pos.id) ?? STOP_RATIO;
         if (lossRatio >= stop) { exits.push({ position: pos, reason: '止损' }); continue; }
@@ -1099,23 +1136,39 @@
           exits.push({ position: pos, reason: '时间止损' });
         }
       }
+      const alive = new Set(snap.positions.map(p => p.id));
       for (const id of state.entryBars.keys()) {
-        if (!snap.positions.some(p => p.id === id)) {
+        if (!alive.has(id)) {
           state.entryBars.delete(id);
           state.exitBars.delete(id);
           state.stopRatio.delete(id);
         }
       }
+      for (const id of state.managed) if (!alive.has(id)) state.managed.delete(id);
+      for (const id of state.warnedIds) if (!alive.has(id)) state.warnedIds.delete(id);
       return exits;
     }
 
     function onSeries({ snap, ctx }) {
+      state.snap = snap;
       prepareFused(ctx);
       const exits = computeExits(snap, ctx);
       if (exits.length) bus.emit(EV.ENGINE_EXITS, { exits });
       const plan = isDriftMode(snap.mode) ? planDrift(snap, ctx) : (planLookahead(snap, ctx) || planIndicator(snap, ctx));
       state.pending = plan;
       bus.emit(EV.ENGINE_PLAN, { plan });
+    }
+
+    // 显式接管：把当前所有持仓纳入自动风控（手动仓位默认不受管）
+    function adoptAll() {
+      let added = 0;
+      for (const pos of state.snap?.positions || []) {
+        if (state.managed.has(pos.id)) continue;
+        state.managed.add(pos.id);
+        added++;
+      }
+      bus.emit(EV.LOG, { msg: '接管 ' + added + ' 笔持仓，纳入自动风控' });
+      return added;
     }
 
     function init() {
@@ -1125,6 +1178,7 @@
       bus.on(EV.SERIES_READY, onSeries);
       bus.on(EV.EXEC_OPENED, ({ position, plan }) => {
         if (!position) return;
+        state.managed.add(position.id);
         if (plan.horizon != null) state.exitBars.set(position.id, state.barCount + plan.horizon);
         state.stopRatio.set(position.id, plan.stopRatio || STOP_RATIO);
         state.lastActionAt = Date.now();
@@ -1136,10 +1190,11 @@
       bus.on(EV.UI_COMMAND, ({ cmd, value }) => {
         if (cmd === 'suppress') state.suppressUntil = Date.now() + (value || SUPPRESS_MS);
         if (cmd === 'action') state.lastActionAt = Date.now();
+        if (cmd === 'adopt') adoptAll();
       });
       return {
         dispose() {},
-        debug: { state, computeExits, planDrift, planIndicator, get pending() { return state.pending; } }
+        debug: { state, computeExits, planDrift, planIndicator, adoptAll, get pending() { return state.pending; } }
       };
     }
 
@@ -1268,17 +1323,29 @@
       closeTrade(snap.positions[0], '全平');
     }
 
+    // 开仓后必须回读真实持仓：DOM 通道点击成功不等于成交，未核验就登记风控会静默失效
+    function verifyPosition(plan) {
+      const res = call('read_fx_game_state');
+      if (res.status !== STATUS.OK) return null;
+      const raw = (res.value.positions || []).find(p => p.pair === plan.pair && (p.side === 'long' ? 1 : -1) === plan.side);
+      return raw ? { id: raw.id, pair: raw.pair, side: raw.side === 'long' ? 1 : -1, margin: raw.margin, leverage: raw.leverage, entry: raw.entry, pnl: raw.pnl } : null;
+    }
+
+    function commit(plan) {
+      if (!openTrade(plan)) return false;
+      const position = verifyPosition(plan);
+      if (!position) { log('开仓未核验到持仓，风控未登记：' + plan.pair); return false; }
+      bus.emit(EV.EXEC_OPENED, { position, plan });
+      return true;
+    }
+
     function execute(plan) {
       if (!plan || state.cfg.automation !== MODE.AUTO) return;
       const now = Date.now();
       if (now <= state.suppressUntil || now - state.lastActionAt <= ACTION_COOLDOWN_MS) return;
       state.lastActionAt = now;
       bus.emit(EV.UI_COMMAND, { cmd: 'action' });
-      if (!openTrade(plan)) return;
-      const res = call('read_fx_game_state');
-      const raw = res.status === STATUS.OK ? res.value.positions.find(p => p.pair === plan.pair) : null;
-      const position = raw ? { id: raw.id, pair: raw.pair, side: raw.side === 'long' ? 1 : -1, margin: raw.margin, leverage: raw.leverage, entry: raw.entry, pnl: raw.pnl } : null;
-      bus.emit(EV.EXEC_OPENED, { position, plan });
+      commit(plan);
     }
 
     function init() {
@@ -1292,7 +1359,7 @@
         if (cmd === 'closeall') startCloseAll();
         if (cmd === 'exec') {
           if (!state.pending) { log('当前没有待执行信号'); return; }
-          openTrade(state.pending);
+          commit(state.pending);
         }
         if (cmd === 'fast') {
           state.fastForward.active = true;
@@ -1323,7 +1390,7 @@
       });
       return {
         dispose() {},
-        debug: { closeAllPositions: startCloseAll, sweepModals, openTrade, closeTrade, advanceDay, state, get pending() { return state.pending; } }
+        debug: { closeAllPositions: startCloseAll, sweepModals, openTrade, closeTrade, advanceDay, commit, verifyPosition, state, get pending() { return state.pending; } }
       };
     }
 
@@ -1544,7 +1611,7 @@
       '    <div><span>动量</span><b data-fxq="roc">—</b></div>',
       '  </div>',
       '  <div class="fxq-advice" data-fxq="advice">等待信号…</div>',
-      '  <div class="fxq-row"><span class="fxq-hint">自动化</span>',
+      '  <div class="fxq-row"><span class="fxq-hint">自动开仓</span>',
       '    <div class="fxq-seg">',
       '      <button class="fxq-btn" data-fxq="auto-off">关</button>',
       '      <button class="fxq-btn" data-fxq="auto-confirm">确认</button>',
@@ -1567,6 +1634,7 @@
       '    <button class="fxq-btn" data-fxq="exec">执行信号</button>',
       '    <button class="fxq-btn" data-fxq="closeall">全平</button>',
       '    <button class="fxq-btn" data-fxq="fast">快进</button>',
+      '    <button class="fxq-btn" data-fxq="adopt">接管</button>',
       '  </div>',
       '  <div class="fxq-kv">',
       '    <div><span>权益</span><b data-fxq="equity">—</b></div>',
@@ -1600,7 +1668,7 @@
         posline: q('posline'), log: q('log'),
         autoOff: q('auto-off'), autoConfirm: q('auto-confirm'), autoAuto: q('auto-auto'),
         tp: q('tp'), rev: q('rev'), tstop: q('tstop'), maxpos: q('maxpos'),
-        exec: q('exec'), closeall: q('closeall'), fast: q('fast'), fold: q('fold')
+        exec: q('exec'), closeall: q('closeall'), fast: q('fast'), adopt: q('adopt'), fold: q('fold')
       });
     }
 
@@ -1613,6 +1681,7 @@
       ui.exec.addEventListener('click', () => bus.emit(EV.UI_COMMAND, { cmd: 'exec' }));
       ui.closeall.addEventListener('click', () => bus.emit(EV.UI_COMMAND, { cmd: 'closeall' }));
       ui.fast.addEventListener('click', () => bus.emit(EV.UI_COMMAND, { cmd: 'fast', value: 30 }));
+      ui.adopt.addEventListener('click', () => bus.emit(EV.UI_COMMAND, { cmd: 'adopt' }));
 
       const LEVS = [5, 10, 20, 30, 50, 100];
       const RISKS = [0.05, 0.1, 0.12, 0.15, 0.2, 0.3];
@@ -1813,16 +1882,18 @@
       });
 
       let waits = 0;
+      let bootTimer = null;
       const boot = () => {
-        if (!PAGE.document.body) { setTimeout(boot, 60); return; }
-        if (!$('longBtn')) { if (++waits < 100) setTimeout(boot, 150); return; }
+        if (!PAGE.document.body) { bootTimer = setTimeout(boot, 60); return; }
+        if (!$('longBtn')) { if (++waits < 100) { bootTimer = setTimeout(boot, 150); return; } }
         build();
-        log('量化辅助台已就绪 v2.2.0（八模块 · MAIN_WORLD）');
+        log('量化辅助台已就绪 v2.4.0（八模块 · MAIN_WORLD）');
       };
+      const stopBoot = () => { if (bootTimer) clearTimeout(bootTimer); bootTimer = null; };
       if (PAGE.document.readyState === 'loading') PAGE.document.addEventListener('DOMContentLoaded', boot, { once: true });
       else boot();
 
-      return { dispose() {}, debug: { ui, logLines, state, renderPanel } };
+      return { dispose() { stopBoot(); }, debug: { ui, logLines, state, renderPanel } };
     }
 
     return { init };
@@ -1831,14 +1902,16 @@
   /* ================================================================ 引导 */
 
   const bus = createBus();
-  const bridge = createBridge(bus).init();
   const store = createStore(bus).init();
+  const bridge = createBridge(bus).init();
   const data = createData(bus).init();
   const series = createSeries(bus).init();
   const engine = createEngine(bus).init();
   const exec = createExec(bus).init();
   const input = createInput(bus).init();
   const ui = createUi(bus).init();
+  // 全部订阅完成后再广播初始配置：提前发会被 DEFAULTS 覆盖已保存设置
+  bus.emit(EV.CONFIG_CHANGED, { cfg: store.debug.cfg });
 
   // 调试/测试兼容层：保持 v1 的 __FXQ__ 形状
   PAGE.__FXQ__ = {
@@ -1879,6 +1952,14 @@
     debugLog: store.debug.debugLog,
     bus,
     busStats: bus.stats,
-    modules: { bridge, store, data, series, engine, exec, input, ui }
+    modules: { bridge, store, data, series, engine, exec, input, ui },
+    // 卸载：停掉定时器与在途请求，再放开引导标记，脚本可被重新注入
+    dispose() {
+      for (const m of [bridge, store, data, series, engine, exec, input, ui]) {
+        try { m.dispose?.(); } catch (err) { console.warn('[fxq] dispose 失败', err); }
+      }
+      delete PAGE.__FXQ_BOOTED__;
+      delete PAGE.__FXQ__;
+    }
   };
 })();

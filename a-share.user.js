@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         大A 简单! · 做市量化台
 // @namespace    fx-quant/a-share
-// @version      3.8.0
-// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；纯凯利定仓（无上限）+ 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储退避 + 移动端适配 + 遮挡补偿 + WS 退避重连 + token 落盘 + 通知弹窗自动关闭 + 杠杆可调
+// @version      3.9.0
+// @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；纯凯利定仓（无上限）+ 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储退避 + 移动端适配 + 遮挡补偿 + WS 退避重连 + token 落盘 + 通知弹窗自动关闭 + 杠杆可调 + 平仓委托接管 + 429 冷却 + requote 限频
 // @match        https://www.bilibili.com/toy/suoha/*
 // @match        https://www.bilibilitoy.com/toy/suoha/*
 // @run-at       document-start
@@ -56,6 +56,10 @@
   const WS_RETRY_BASE = 1000;      // WS 重连退避起点
   const WS_RETRY_MAX = 30000;      // WS 重连退避上限
   const WS_RETRY_JITTER = 0.2;     // 重连抖动 ±20%，避免多客户端同步重连风暴
+  // 服务端限频实测（probe-rate.mts）：1000ms 间隔 10 次全通过；300ms 第 9 次 429；无间隔第 2 次即 429
+  const RATE_COOLDOWN_MS = 3000;   // 429 后全局冷却
+  const MIN_REQ_GAP_MS = 350;      // 请求最小间隔（实测 300ms 会累积到阈值）
+  const REQUOTE_MIN_MS = 4000;     // 撤单重挂最小间隔：WAIT_MS=25000 内最多 6 次
 
   const PHASE = Object.freeze({ idle: '空闲', bidding: '挂买中', asking: '挂卖中', closing: '平仓中' });
   const LEV_MIN = 1;              // 服务端下限
@@ -115,6 +119,7 @@
     deadline: 0,
     grace: 0,
     stopAt: 0,
+    lastRequote: 0,
     seq: 0,
   };
 
@@ -252,7 +257,16 @@
 
   let inflight = null;
 
+  let cooldownUntil = 0;   // 429 冷却截止时刻
+  let lastReqAt = 0;       // 上次请求时刻（全局最小间隔）
+  function resetRate() { cooldownUntil = 0; lastReqAt = 0; }   // 测试用：清掉限频状态
+
   async function post(path, body = {}, auth = true) {
+    const now = Date.now();
+    if (now < cooldownUntil) throw new Error('限频冷却 ' + Math.ceil((cooldownUntil - now) / 1000) + 's');
+    const gap = now - lastReqAt;
+    if (gap > 0 && gap < MIN_REQ_GAP_MS) await new Promise(r => setTimeout(r, MIN_REQ_GAP_MS - gap));
+    lastReqAt = Date.now();
     const base = new URL('api/', PAGE.A_SHARE_BACKEND_URL || BACKEND);
     const headers = { 'Content-Type': 'application/json', 'X-A-Share-Action': '1' };
     if (auth && conn.token) headers.Authorization = 'Bearer ' + conn.token;
@@ -265,6 +279,10 @@
       signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0],
     });
     const d = await r.json().catch(() => null);
+    if (r.status === 429) {
+      cooldownUntil = Date.now() + RATE_COOLDOWN_MS;
+      throw new Error('操作太快，冷却 ' + (RATE_COOLDOWN_MS / 1000) + 's');
+    }
     if (!r.ok) throw new Error((d && (d.detail || d.error)) || '操作失败');
     return d;
   }
@@ -352,6 +370,18 @@
     return ref > 0 && Math.abs(price / ref - 1) <= LIMIT_BAND;
   }
 
+  // 该仓位是否已有待成交的平仓委托。服务端规则（实测 probe-ghost.mts）：
+  // 同一仓位有 open 的平仓委托时，任何再次平仓都被 400 拒绝「这笔仓位已有待成交的平仓委托，请先撤单。」
+  // orders[] 含历史 filled 单不清空，所以必须按 status 过滤。
+  function openCloseOf(snap, posId) {
+    const os = (snap.account && snap.account.orders) || [];
+    for (let i = 0; i < os.length; i++) {
+      const o = os[i];
+      if (o.status === 'open' && o.action === 'close' && o.positionId === posId) return o;
+    }
+    return null;
+  }
+
   let lastPosCount = 0;
 
   function planIdle(snap) {
@@ -360,7 +390,12 @@
     if (ps.length > 1 && ps.length !== lastPosCount) pushLog('警告：' + ps.length + ' 个持仓，自动模式只管理第一个');
     lastPosCount = ps.length;
     const pos = ps[0] || null;
-    if (pos) return { type: 'ask', pos };
+    if (pos) {
+      // 已有待成交平仓委托 → 接管它，不重复挂（否则服务端 400 且每快照重试）
+      const oc = openCloseOf(snap, pos.id);
+      if (oc) return { type: 'adopt', pos, orderId: oc.id };
+      return { type: 'ask', pos };
+    }
     const orders = (snap.account && snap.account.orders) || [];
     for (let i = 0; i < orders.length; i++) if (orders[i].status === 'open') return { type: 'none' };
     const pick = pickPair(snap);
@@ -387,6 +422,8 @@
     const od = orderById(snap, mm.orderId);
     if (!od && Date.now() < mm.grace) return { type: 'none' };
     if (!od || od.status !== 'open') return { type: 'ask', pos };
+    // 实测 5 秒波动 0.30~0.39%（≈2.5 tick）→ 不限频几乎每快照都 requote，2 请求/次必触发 429
+    if (Date.now() - mm.lastRequote < REQUOTE_MIN_MS) return { type: 'none' };
     if (Math.abs(od.price - want) >= conn.tickOf(pos.stock) * 2) return { type: 'requote', pos, price: want };
     if (Date.now() > mm.deadline) return { type: 'stop', pos };
     return { type: 'none' };
@@ -460,6 +497,9 @@
 
   async function closeLimit(snap, pos, why) {
     if (!(await ensureToken())) { pushLog('无 token，跳过止损'); return reset(); }
+    // 同仓已有待成交平仓委托 → 先撤，否则服务端 400 且后续重试放大
+    const oc = openCloseOf(snap, pos.id);
+    if (oc) { mm.orderId = oc.id; if (!(await cancelOrder())) return; }
     const bk = snap.orderBooks[pos.stock];
     const bid = bk && bk.bids && bk.bids[0];
     if (!bid) return closeMarket(pos, why);
@@ -467,7 +507,8 @@
     const ref = refPrice(snap, pos.stock);
     if (!inBand(price, ref)) { pushLog('止损价 ' + price + ' 超出现价 ' + ref + ' 的 ±20%，改市价'); return closeMarket(pos, why); }
     try {
-      await post('close', { id: pos.id, orderType: 'limit', limitPrice: price });
+      const r = await post('close', { id: pos.id, orderType: 'limit', limitPrice: price });
+      mm.orderId = (r && r.orderId) || null;   // 记下平仓单 id，降级时先撤它
       mm.phase = 'closing';
       mm.posId = pos.id;
       mm.stopAt = Date.now();
@@ -484,6 +525,13 @@
       pushLog('市价平 ' + conn.nameOf(pos.stock) + '(' + why + ')');
     } catch (e) { pushLog('平仓失败: ' + e.message); }
     reset();
+  }
+
+  // 降级市价平仓：先撤自己的限价平仓单，否则服务端 400「已有待成交的平仓委托」
+  async function stopWithCancel(snap, pos, why) {
+    const oc = openCloseOf(snap, pos.id);
+    if (oc) { mm.orderId = oc.id; if (!(await cancelOrder())) return; }
+    return closeMarket(pos, why);
   }
 
   async function cancelOrder() {
@@ -505,14 +553,25 @@
       case 'ask': return placeAsk(snap, plan.pos);
       case 'requote': {
         if (!(await cancelOrder())) return;
+        mm.lastRequote = Date.now();
         return placeAsk(snap, plan.pos);
+      }
+      case 'adopt': {
+        // 接管服务端已有的平仓委托：不重复下单，只同步本地状态
+        mm.phase = 'asking';
+        mm.orderId = plan.orderId;
+        mm.posId = plan.pos.id;
+        mm.deadline = Date.now() + WAIT_MS;
+        mm.grace = 0;
+        pushLog('接管已有平仓委托 ' + conn.nameOf(plan.pos.stock));
+        return;
       }
       case 'cancel': {
         if (!(await cancelOrder())) return;
         return reset(plan.why);
       }
       case 'stop': return closeLimit(snap, plan.pos, '止损');
-      case 'stopMarket': return closeMarket(plan.pos, '止损降级');
+      case 'stopMarket': return stopWithCancel(snap, plan.pos, '止损降级');
       case 'reset': return reset(plan.why);
       default: return;
     }
@@ -529,7 +588,7 @@
       if (seq !== mm.seq) return;
       await execute(snap, plan);
     } catch (e) {
-      if (e && e.name !== 'AbortError') pushLog('错误: ' + e.message);
+      if (e && e.name !== 'AbortError') { pushLog('错误: ' + e.message); reset(); }
     } finally {
       clearTimeout(timer);
       inflight = null;
@@ -775,5 +834,5 @@
   else setTimeout(mount, 0);
   if (/[?&]aq_anon=1/.test(location.search)) setTimeout(useAnonymous, 800);
 
-  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, ensureToken, PAGE, planIdle, planBidding, planAsking, planClosing, refPrice, inBand, LIMIT_BAND, shiftTimers, cacheToken, cloud, dismissNotices, cfg, saveCfg, clampInt, LEV_MIN, LEV_MAX };
+  window.__AQ__ = { conn, mm, ui, stats, bus, kelly, step, pickPair, useAnonymous, ensureToken, PAGE, planIdle, planBidding, planAsking, planClosing, refPrice, inBand, LIMIT_BAND, shiftTimers, cacheToken, cloud, dismissNotices, cfg, saveCfg, clampInt, LEV_MIN, LEV_MAX, openCloseOf, execute, closeLimit, stopWithCancel, placeAsk, RATE_COOLDOWN_MS, MIN_REQ_GAP_MS, REQUOTE_MIN_MS, resetRate };
 })();

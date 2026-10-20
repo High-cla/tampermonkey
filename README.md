@@ -1,4 +1,4 @@
-# FX 简单! · 量化辅助台 v2.1.0
+# FX 简单! · 量化辅助台 v2.4.0
 
 B站小游戏「FX 简单!」(<https://www.bilibili.com/toy/fx-simple/index.html>) 的 Tampermonkey 辅助脚本。
 **模拟盘游戏**，不接任何真实资金。桌面（Chrome / Edge）与 Android（Chromium + Tampermonkey）通用。
@@ -8,16 +8,19 @@ B站小游戏「FX 简单!」(<https://www.bilibili.com/toy/fx-simple/index.html
 v2.1 按单一职责把 Data（301 行）拆成 **data**（快照+触发源）与 **series**（序列+指标），
 把 Ui（422 行）拆成 **ui**（面板+渲染）与 **input**（拖拽+断点+位置），模块间仍只经总线通信。
 
+v2.3 只动边界、不动交易阈值：未来数据隔离、配置启动顺序、统一敞口闸、开仓回读核验、受管仓位范围。
+v2.4 补生命周期：模块可卸载、在途请求可取消、异步工具接口明确失败。
+
 | 模块 | 行数 | 职责 |
 |---|---|---|
-| bridge | 153 | 同 world 直挂 polyfill（沙盒模式才退回注入）+ 工具句柄 + 存档读取（引用缓存） |
-| store | 24 | 配置持久化 + 调试环 |
+| bridge | 162 | 同 world 直挂 polyfill（沙盒模式才退回注入）+ 工具句柄 + 存档读取（引用缓存） |
+| store | 24 | 配置持久化 + 调试环（初始广播交给引导层，避免订阅前丢事件） |
 | data | 155 | 快照采集 + tick 计数 + 新闻识别 + 触发源 |
-| series | ~140 | 序列获取（存档/采样/frankfurter）+ 指标缓存 + ctx 构建 |
-| engine | 187 | 漂移/指标决策 + 风控退出 + 定量与敞口（凯利按引用缓存） |
-| exec | 181 | 下单/平仓/推进日/弹窗白名单清扫/全平队列（DOM 引用缓存） |
-| input | ~120 | Pointer 拖拽 + 断点检测 + 位置持久化 + 折叠状态 |
-| ui | 325 | 面板 DOM + diff 渲染（含 CSS 与模板约 90 行） |
+| series | 181 | 序列获取（存档/采样/frankfurter）+ `historyView` 未来隔离 + 指标缓存 + ctx 构建 |
+| engine | 266 | 漂移/指标决策 + 统一敞口闸 + 受管仓位退出 + 定量（凯利按引用缓存） |
+| exec | 193 | 下单 / 回读核验 / 平仓 / 推进日 / 弹窗白名单清扫 / 全平队列（DOM 引用缓存） |
+| input | 135 | Pointer 拖拽 + 断点检测 + 位置持久化 + 折叠状态 |
+| ui | 361 | 面板 DOM + diff 渲染（含 CSS 与模板约 90 行） |
 
 ```
         ┌──────────────── bus（事件总线，独立实例）────────────────┐
@@ -41,7 +44,7 @@ v2.1 按单一职责把 Data（301 行）拆成 **data**（快照+触发源）�
 | `bridge:ready` | bridge | data/exec | `{ via, call, has, readSave }` |
 | `bridge:blocked` | bridge | ui | `{ reason }` |
 | `config:save` | ui | store | `{ patch }` |
-| `config:changed` | store | data/engine/exec/ui | `{ cfg }` |
+| `config:changed` | store / 引导层（初始一次） | data/engine/exec/ui | `{ cfg }` |
 | `log:add` | 任意 | ui/store | `{ msg }` |
 | `data:request` | exec/ui | data | — |
 | `data:bar` | data | engine | `{ at, count }` |
@@ -58,6 +61,28 @@ v2.1 按单一职责把 Data（301 行）拆成 **data**（快照+触发源）�
 | `ui:sweep` | data | exec | — |
 
 数据流：`bridge →(工具能力)→ data →(快照)→ series →(快照+ctx)→ engine →(计划+退出)→ exec`，失败一律经 `log:add` 汇到 ui，模块之间不互相 catch。
+
+### 正确性边界（v2.3）
+
+五条不变量，任何调参都不能绕过：
+
+| 边界 | 实现 | 回归测试 |
+|---|---|---|
+| **未来隔离** | `historyView(series)` 按 `cursor` 截断价格与 K 线；`future` 只给前瞻引擎 | 改 `cursor` 之后的价格，评分必须不变 |
+| **配置必达** | store 不在 `init` 里广播；引导层在八个模块订阅完成后才 `emit(config:changed)` | 存储 5×/固定 5% 必须传到 engine/exec/ui |
+| **敞口闸** | `applyExposure` 被 drift / lookahead / indicator 三引擎共用；首仓（原敞口为 0）同样受限 | 权益 $10,000、上限 5× → 首仓名义 ≤ $50,000 |
+| **执行核验** | `commit()` = 下单 → `read_fx_game_state` 回读 → 确认持仓才发 `exec:opened` | 回读无持仓时不得登记风控 |
+| **受管范围** | `managed` 集合只装脚本开出的仓位；手动仓位需点「接管」才纳入自动风控 | 手动仓位不自动处置，接管后按止损退出 |
+
+「自动开仓：关」的语义是**只禁止自动开仓**，自动风控继续工作；面板标签已从「自动化」改为「自动开仓」消除歧义。
+
+### 生命周期（v2.4）
+
+`__FXQ__.dispose()` 卸载：逐个调用八模块的 `dispose()`，清掉定时器、`MutationObserver`、`matchMedia` / `visualViewport` 监听，`AbortController.abort()` 取消在途历史请求，最后删掉 `__FXQ_BOOTED__` 让脚本可被重新注入。重复调用幂等。
+
+`bridge.call()` 检测工具返回 Promise：原生 WebMCP 规范里 `execute` 是异步的，而当前决策链是同步的。遇到 thenable 一律返回 `failed` 并记日志，**不会把 Promise 当数据用**——这条为将来接原生 `executeTool` 留出明确失败面。
+
+**实测请求不是瓶颈**（`probe-fetch.mts`，真实 Edge 回放）：推进 90 个交易日、77 秒，只发出 **1 次** frankfurter 请求（`historyKeys` 1→2，仅 TTL 到期重拉一次）；7 个品种共享同一份 EUR-base 数据，**0 次重复请求**。所以没有引入请求去重或缓存上限——现状已够，加了只是多余实体。
 
 ### 触发源：事件驱动 + 兜底
 
@@ -104,9 +129,9 @@ DOM 一变即采集（对齐游戏的 1.5s tick）；另有 500ms 定时兜底 �
 3. **没有到期平仓**：前瞻看 3 天，但唯一持有期约束是 `timeStopBars = 20` 且只在亏损时触发 → 3 天后利润回吐。
    改为 `exitBars = barCount + horizon`，到期无条件平，且到期前跳过指标反转判据（否则真先知被滞后指标砍掉）。
 
-前瞻引擎开仓条件：`|future[2]/prices[cursor] - 1| - (0.00005 + lev*0.000005) ≥ 0.15%`，持有 3 个交易日后平仓。
+前瞻引擎开仓条件：`|future[H-1]/prices[cursor] - 1| - (0.00005 + lev*0.000005) ≥ 0.05%`，持有 `LOOKAHEAD_HORIZON` 个交易日后**无条件**平仓（当前 H=1）。
 
-### 参数扫参：三个参数里两个是死的
+### 参数扫参：前瞻三参数里两个在回测中无效
 
 `sim/` 目录是一套离线回放器：把 `planLookahead` / `computeExits` / `sizePosition` / `exposureScale` / `kellyFraction`
 逐行复刻成纯函数（对照 `app.game.js:724/730` 与 `fx-quant.user.js:338/948/957/1023`），
@@ -136,6 +161,119 @@ DOM 一变即采集（对齐游戏的 1.5s tick）；另有 500ms 定时兜底 �
 **指标引擎**：止损 40% / 止盈 90% / 反转（评分反向 ≥30）/ 时间止损（20 bar 未盈利）。
 
 **定量（共用）**：半凯利（从游戏平仓记录在线估 p、b，夹在 [8%,25%]）；货币净敞口超「权益 × 5」按比例缩仓，缩后低于权益 2% 放弃；同品种同向 15 秒冷却，反手放行。
+
+### 可调参数
+
+**面板可调**（点击循环，存 `localStorage['fxq-config-v1']`）：
+
+| 参数 | 默认 | 档位 | 作用 |
+|---|---|---|---|
+| 自动开仓 | 关 | 关 / 确认 / 自动 | 关 = 不自动开仓（**自动风控仍生效**）；自动 = 自动开仓 |
+| 杠杆 | 30× | 5/10/20/30/50/100 | 名义敞口与手续费 |
+| 风险 | 凯利 12% | 凯利 → 5/10/12/15/20/30% | 单笔保证金占权益 |
+| 前瞻 | 关 | 开关 | real/battle 使用未来价 |
+| 止盈 | 90% | 50/70/90/120/150% | 指标引擎止盈线 |
+| 反转 | 30 | 20/25/30/40/50 | 指标引擎反转退出阈值 |
+| 时间止损 | 20 | 10/15/20/30/50 | 指标引擎 N bar 未盈利离场 |
+| 并发 | 4 | 2/3/4/5 | 同时持仓上限 |
+
+**硬编码**（改需动源码常量区）：
+
+| 常量 | 值 | 作用 |
+|---|---|---|
+| `STOP_RATIO` | 0.40 | 止损线（漂移仓按强度在 0.25~0.50 间动态） |
+| `STOP_MIN` / `STOP_MAX` | 0.25 / 0.50 | 漂移仓动态止损区间，上限避开游戏 0.6 冻结线 |
+| `DRIFT_MIN_SUM` | 0.0015 | 漂移累积开仓阈值 |
+| `DRIFT_MIN_BARS` / `DRIFT_MAX_BARS` | 8 / 30 | 持有期搜索范围 |
+| `LOOKAHEAD_HORIZON` | 1 | 前瞻天数。**两处实验结论冲突**：2 年 oracle 回测 H=1 年化 1162% > H=3 的 462%；真实游戏 26 天对照 H=3 +41.2% > H=2 +19.2%（H=1 未测）。当前取 1，待同引擎回测后再定 |
+| `LOOKAHEAD_MIN_NET` | 0.0005 | 前瞻扣费后最小净空间（回测：0.05% 年化 1425%，0.15% 只有 1162%） |
+| `ENTRY_COOLDOWN_MS` / `_FAST_MS` | 15000 / 1000 | 同品种同向重进冷却：sim 1.5s/tick 用 15s，real 800ms/天用 1s |
+| `LOOKAHEAD_BOOST` / `LOOKAHEAD_CONFLICT` | 0.3 / 0.4 | 前瞻与指标同向放大 / 反向削弱 |
+| `MAX_CCY_NOTIONAL_MULT` | 5 | 单一货币净名义上限（权益倍数） |
+| `KELLY_FRACTION` | 0.5 | 半凯利系数 |
+| `SIGNAL_THRESHOLD` / `SIGNAL_STRONG` | 30 / 55 | 指标评分开仓 / 强弱分界 |
+| `SCORE_WEIGHTS` | 30/20/20/15/15 | 五因子权重（和为 100） |
+| `IND` | 12/26/9/40/14/14/20/2/10 | EMA / MACD / RSI / ATR / BOLL / ROC 周期 |
+
+**工程参数**（不建议暴露）：`FALLBACK_MS` 500、`BACKGROUND_MS` 2000、`SWEEP_MS` 1500、`ACTION_COOLDOWN_MS` 2500、`DAY_ADVANCE_MS` 800、`SERIES_TTL_MS` 60000、`SAMPLE_INTERVAL_MS` 1200。
+
+### 参数回测依据
+
+`backtest-params.mts` 用 frankfurter 2023-10 ~ 2025-10 的 EUR/USD（512 个交易日）做完美预测回测（前瞻引擎在 real 模式确实能预知方向，游戏价与 API 价比值恒 1.000000）：
+
+| 持有期 H | 笔数 | 止损 | 在仓率 | 终值 | 年化 |
+|---|---|---|---|---|---|
+| **1** | 321 | 0 | 63% | **$1,726,440** | **1162%** |
+| 2 | 219 | 0 | 86% | $712,783 | 717% |
+| 3 | 155 | 0 | 91% | $334,055 | 462% |
+| 5 | 97 | 0 | 95% | $171,106 | 305% |
+| 10 | 50 | 0 | 98% | $79,907 | 178% |
+| 20 | 25 | 2 | 98% | $32,038 | 77% |
+
+阈值扫描（H=1）：0% 年化 1471%、0.05% 1425%、0.10% 1325%、0.15% 1162%、0.30% 658% —— 越低越好，但低于手续费（0.02% 名义）会亏本。
+
+**回测暴露的冷却冲突**：`ENTRY_COOLDOWN_MS = 15000` 是为 sim（1.5s/tick）设计的；real 模式自动推进 800ms/天，等 15 秒等于错过 18 天，H=1 策略会被自己的冷却卡死。已按模式区分。
+
+### 全参数大规模回测
+
+| 引擎 | 样本规模 | 参数 | 结论 |
+|---|---|---|---|
+| 指标引擎 | frankfurter 1999-01 ~ 2025-10，6850 日 × 7 品种 = **47,950 品种-日**（27.2 年） | STOP / TP / REV / TSTOP / THRESHOLD / SCORE_WEIGHTS / MIN_POSITION / MAX_POSITIONS / CCY_MULT / LEV / RISK | **全线负收益** −0.4% ~ −28.7%（限该回测模型，见「回测与实盘的已知偏差」） |
+| drift 引擎 | 合成 sim（app.game.js:1062 同公式），50,000 tick × 7 品种 = **350,000 品种-tick**（20.8 小时） | DRIFT_MIN_SUM / DRIFT_MIN_BARS / DRIFT_MAX_BARS | 胜率 **81.3%**、单笔 **16.70%**（毛，未扣开仓费）、回撤 **3.8%**；回测里只有 `DRIFT_MAX_BARS` 有效 |
+| 前瞻引擎 | frankfurter 512 日（**oracle 基准**：直接用真实未来决定方向） | LOOKAHEAD_HORIZON / MIN_NET | H=1 年化 1162%（H=3 的 2.5 倍）；0.05% 阈值最优。这是游戏白盒玩法的上限，不是市场预测能力 |
+
+**指标引擎为什么必亏**（限回测模型）：胜率 28.9% + 盈亏比 tp/stop = 0.9/0.4 = 2.25 → 打平需 30.8% 胜率，缺 2 个百分点 × 1728 笔 = 复利归零（终值只剩两美元）。缩小仓位（risk 2% → −1.1%、maxPos 1 → −0.4%、ccyMult 1 → −1.1%、lev 5x → −2.4%）只是**按比例减小亏损**，期望值恒为负。唯一接近打平的是纯反转权重（−0.8%，但只有 218 笔）。
+
+**drift 参数实测（8 个 seed 平均单笔 16.98%）**：
+
+- `DRIFT_MIN_SUM`：**该结论已被推翻**。复刻回测里 0% ~ 0.5% 结果完全相同，但那是复刻引擎只在候选过滤处用了它；真实引擎还用它算仓位强度与动态止损。统一回测（见下）显示它**确实有效**。
+- `DRIFT_MIN_BARS`：**同样被推翻**。复刻回测里 1 ~ 12 完全相同只说明优化器很少选小 h，真实引擎里 12 / 20 都会改变结果。
+- `DRIFT_MAX_BARS`：复刻回测里 10 → 5001 笔 / 单笔 9.79%、27+ → 2474 笔 / 单笔 16.70%。方向与统一回测一致，但最优值不同。
+
+**drift 相位模型勘误**：app.game.js:1066 的 `index` 是 `PAIRS.forEach((pair, index)` 的**品种索引**（常数偏移），只有 `Date.now()/13000` 随时间增长 → 每 tick 相位增量 0.11538 rad，周期 **54.5 tick（81.7 秒）**。早前按 `index*2` 也随时间增长建模会得到 3 tick 周期，导致合成回测全 0 笔。
+
+**回测与实盘的已知偏差**（结论只能当趋势，不能当复现）：
+
+| 项 | 回测 | 实盘 |
+|---|---|---|
+| 指标 ATR | `atrSeries` 首次扣窗越界（`v[i-n+1]-v[i-n]`），留下异常前缀 | `atrOf` 取末 n 根真实区间 |
+| MACD 归一化 | 全历史 EMA ÷ (ATR×0.4) | 末 40 窗 EMA ÷ (ATR×0.5) |
+| drift 仓位 | 单仓、固定 12%、封顶 $1000、40% 止损 / 90% 止盈 | 多仓、半凯利、新闻权重、敞口闸、25~50% 动态止损、反手 |
+| drift 退出 | 固定止损/止盈 | 零交叉反手 + 到期，**不走止盈** |
+| 冷却 | 无 | sim 15s / real 1s 重进冷却 + 2.5s 执行节流 |
+| 样本独立性 | 7 品种共用同一正弦时钟与汇率换算，seed 只改噪声 | — |
+| 引擎 | 手写复刻（`backtest-drift-sim.mts`） | 真实脚本函数（`backtest-unified.mts` + `engine-core.mts`） |
+
+因此 **350,000 品种-tick 不是 350,000 笔独立交易**，扫参也没有样本外验收。
+
+### 统一回测（决策与结算直接来自脚本）
+
+`engine-core.mts` 把 `fx-quant.user.js` 装进 vm 沙箱（冻结时钟、假 localStorage、可注入游戏工具），
+`backtest-unified.mts` 直接调用脚本里的 `driftSignals` / `planDrift` / `computeExits` / `exec.commit` / `exec.closeTrade`——**没有一行复刻**。
+行情用 `app.game.js:1062` 同公式，结算走真实 `place_fx_trade` / `close_fx_trade` 假实现（含手续费），状态机（受管仓位、到期、冷却）全部由脚本自己维护。
+
+固定保证金 $1000 隔离复利，20,000 tick × 7 品种，6 个种子：
+
+| 配置 | 笔数 | 胜率 | 单笔 | 净利 | 回撤 |
+|---|---|---|---|---|---|
+| **当前默认**（minSum 0.0015 / maxBars 30） | 4427 | 78.8% | 14.24% | $603,837 | 4.4% |
+| maxBars **20** | 4411 | **81.2%** | **15.28%** | **$647,495** | 4.8% |
+| minSum **0.005** | 4260 | 80.7% | 15.52% | $635,509 | 4.2% |
+| minSum 0.005 + maxBars 20 | 3928 | 80.6% | 16.13% | $609,913 | 4.4% |
+| minSum 0.006 + maxBars 20 | 0 | — | — | $0 | 0% |
+
+多种子稳健性（6 个种子，相对默认）：
+
+- **maxBars 30 → 20**：平均 **+7.4%**，最差 +5.8%，**6/6 为正**。
+- **minSum 0.0015 → 0.005**：平均 +6.0%，最差 +3.4%，6/6 为正。
+- **两者同时改**：只剩 +1.0%——效果重叠，都在过滤低质量信号，叠加没有额外收益。
+
+**结论：`DRIFT_MAX_BARS = 20` 是唯一值得考虑的改动**（+7.4% 且最差情形仍 +5.8%）。但它改的是默认交易行为，代码里仍是 30，是否应用由使用者决定。
+
+另外两个由统一回测暴露的事实：
+
+- **退出几乎全靠反手**：4427 笔里 4417 笔是「反手」，止损只触发 7 次。动态止损 `clamp(0.25 + |drift|/0.0015 × 0.05, 25%, 50%)` 在实盘路径上基本不起作用——信号翻转总是先发生。
+- **手续费占净利 4.4%**（$26,562 / $603,837）：高频反手是主要成本，但仍在盈利区间内。
 
 ## 性能实测（Edge + CDP，15 秒全自动）
 
@@ -177,6 +315,7 @@ DOM 一变即采集（对齐游戏的 1.5s tick）；另有 500ms 定时兜底 �
 | `matchMedia` / `visualViewport` | 断点与软键盘 | 原生断点事件，无需监听 `resize` |
 | Pointer Events + `setPointerCapture` | 面板拖拽 | 鼠标 / 触摸 / 笔同一套代码 |
 | `AbortSignal.timeout` | 历史序列 fetch | 原生超时，无需手写 setTimeout 竞速 |
+| `AbortSignal.any` + `AbortController` | 卸载时取消在途请求 | 一个信号合并「超时」与「卸载」，dispose 即停 |
 | `Array.at` / `Object.freeze` / getter | 只读视图与不可变常量 | 配置与契约不可被误改 |
 | `Map` / `Set` | 缓存、冷却、去重 | O(1) 查表替循环 `find` |
 
@@ -193,7 +332,6 @@ DOM 一变即采集（对齐游戏的 1.5s tick）；另有 500ms 定时兜底 �
 | `WeakRef` / `FinalizationRegistry` | 缓存已有 TTL + 指纹，不需要 GC 感知 |
 | `Object.groupBy` / `Map.groupBy` | 需要的是累加（`currencyNotional`）而非分组 |
 | `flat` / `flatMap` / `replaceAll` / `findLast` / `Object.hasOwn` | 无对应场景，现有写法更直接 |
-| `AbortController` | fetch 已有超时；切模式后旧请求自然失效 |
 | `dialog` / `popover` | 面板在游戏 iframe 内，无需焦点陷阱 |
 | `BroadcastChannel` | 无多标签同步场景 |
 | `Element.animate` | CSS transition 已够 |
@@ -211,14 +349,33 @@ const bollPos = boll && boll.upper > boll.lower ? (last - boll.lower) / (boll.up
 if (sig && sig.side !== pos.side) { ... }
 ```
 
+## 真实环境安装（Edge + Tampermonkey）
+
+**必须手动开启「允许用户脚本 / Allow User Scripts」，否则脚本根本不会注入。**
+
+Chromium 138+ 起，MV3 扩展调用 `chrome.userScripts` 需要用户在扩展详情页显式开启。实测本机 Edge 149 + 篡改猴测试版 5.6.6242：
+
+- 扩展的 `chrome.userScripts` 是 `undefined` → TM 无法注入 `@sandbox raw`，`window.__FXQ__` 恒为 `undefined`。
+- 直接改 `Preferences` / `Secure Preferences` 里的 `user_scripts_allowed` **无效**——这两个文件有完整性校验，浏览器启动时会回退。
+
+步骤：`edge://extensions` → 篡改猴测试版 → 详情 → 打开「允许用户脚本」→ 刷新游戏页。
+
+`test-tm.mts` 分三段跑：
+
+1. **安装链路**（任何环境都应通过）：扩展进程、安装页弹出、脚本写入 TM 存储、`enabled`、`version`、`@match`、`@sandbox`、`@run-at`、源码字节数。
+2. **能力检测**：`chrome.userScripts` 是否可用。
+3. **注入验证**（能力就绪才跑）：MAIN world 可见、`document.modelContext` 已 hook、`via=api`、四个游戏工具全部捕获、`dispose` 可用。
+
+未开启开关时第 3 段输出 **SKIP 并打印操作指引**，不会误报成脚本缺陷。实测：`9 PASS / 0 FAIL / 1 SKIP`。
+
 ## 测试
 
-单条命令：`node run-tests.mts` —— **约 27 秒**（同样的 9 个测试串行需要 277 秒，加速 10×）。
+单条命令：`node run-tests.mts` —— **约 27~30 秒**（静态 5 个并行 + 浏览器 1 个独占；波动全来自 `test-all.mts` 的 26~30s）。
 
 | 层 | 文件 | 内容 |
 |---|---|---|
-| 静态（并行，<1s） | `test-arch.mts` / `test-indicators.mts` / `test-drift-math.mts` | 8 模块互不引用与 18 条事件契约、指标与汇率换算、闭式解等价性 |
-| 浏览器（单 browser + 四组 context 并行） | `test-all.mts` | 六场景 **42 条断言**：e2e / closeall / drift / automation / replay / mobile |
+| 静态（并行，<1s） | `test-arch.mts` / `test-contract.mts` / `test-indicators.mts` / `test-drift-math.mts` / `test-kelly.mts` | 8 模块互不引用与 18 条事件契约、**28 条正确性边界**（vm 沙箱离线）、指标与汇率换算、闭式解等价性、凯利 |
+| 浏览器（单 browser + 四组 context 并行） | `test-all.mts` | 六场景 **46 条断言**：e2e / closeall / drift / automation / replay / mobile |
 
 **并行策略**（为什么是四组而不是六路全开）：
 
@@ -232,17 +389,30 @@ if (sig && sig.side !== pos.side) { ... }
 
 单个 `test-e2e.mts` / `test-closeall.mts` / `test-drift.mts` / `test-automation.mts` / `test-replay.mts` / `test-mobile.mts` 保留用于细粒度调试（单独跑更快定位）。
 
+`test-tm.mts` **不在** `run-tests.mts` 里：它需要本机装有 Tampermonkey 扩展，属于环境验收而非代码回归，单独执行 `node test-tm.mts`。
+
 ## 已知限制
 
 - **这是白盒套利**：利用 `tickSim` 的实现细节（不读未来、不改状态），真实市场不存在这种确定性。
 - 脚本只自动清理**没有 `modalAction`** 的弹窗；带 action 的（重新开始 / 借款 / 还款 / 金盆洗手）一律留给玩家。
 - 挑战模式的行情由 `challengeSim` 驱动且不存档：漂移引擎不需要 K 线即可交易，但指标区显示为空。
 - 货币敞口按开仓瞬间的 equity 计算上限，浮盈会让 equity 上升，实测可能超出 0.6%。
+- **DOM 通道拿不到保证金**：`domSnapshot` 的 `margin` 为 `NaN`，该通道下自动风控会跳过并在日志告警；需要完整风控请确保走游戏工具接口。
+- **回测不是当前实现的同引擎复现**：见「回测与实盘的已知偏差」表，历史数字只能当趋势。
+- **E2E 是 `addInitScript` 直注**，绕过 Tampermonkey 的匹配、授权与沙箱；真实扩展通道见「真实环境安装」。
+- **真实 TM 注入依赖手动开启 `Allow User Scripts`**：自动化无法代劳（改偏好文件会被完整性校验回退）。未开启时脚本在真实浏览器里完全不运行，且没有任何报错。
+- 本机实测：TM 的 `Local Extension Settings` 里只有 LevelDB 骨架、无数据文件，说明此前从未真正加载过任何用户脚本。
+- `test-indicators.mts` 会请求 frankfurter，属**网络契约测试**，不是纯离线。
 
 ## 文件
 
 - `fx-quant.user.js` — 油猴脚本（可直接安装）
 - `test-arch.mts` — 架构约束：模块互不引用、事件契约双向闭合、单一入口
+- `test-contract.mts` — 正确性边界回归（离线 vm 沙箱）：未来隔离、配置恢复、敞口闸、受管仓位、执行核验、异步契约、可卸载
+- `probe-fetch.mts` — 回放模式 frankfurter 请求基线（次数 / 去重 / 窗口复用），用来证明「请求不是瓶颈」
+- `test-tm.mts` — 真实 Edge + Tampermonkey 冒烟（临时 profile + 真实扩展）：安装链路 / 能力检测 / 注入验证
+- `engine-core.mts` — 把脚本装进 vm 沙箱并导出真实决策函数 + 记账式假游戏工具
+- `backtest-unified.mts` — 统一回测：直接调脚本的 `planDrift` / `computeExits` / `exec.commit`，扫参 + 多种子稳健性
 - `test-mobile.mts` — 移动端：默认折叠、视口内、触摸目标、Pointer 拖拽、边界钳制、桌面恢复
 - `test-drift.mts` / `test-drift-math.mts` — 漂移引擎行为与闭式解等价性
 - `test-e2e.mts` / `test-closeall.mts` / `test-automation.mts` — 端到端、全平、自动化与安全边界
