@@ -10,7 +10,7 @@ v2.1 按单一职责把 Data（301 行）拆成 **data**（快照+触发源）�
 
 | 模块 | 行数 | 职责 |
 |---|---|---|
-| bridge | 153 | 双通道注入 + 工具句柄 + 存档读取（引用缓存） |
+| bridge | 153 | 同 world 直挂 polyfill（沙盒模式才退回注入）+ 工具句柄 + 存档读取（引用缓存） |
 | store | 24 | 配置持久化 + 调试环 |
 | data | 155 | 快照采集 + tick 计数 + 新闻识别 + 触发源 |
 | series | ~140 | 序列获取（存档/采样/frankfurter）+ 指标缓存 + ctx 构建 |
@@ -106,6 +106,29 @@ DOM 一变即采集（对齐游戏的 1.5s tick）；另有 500ms 定时兜底 �
 
 前瞻引擎开仓条件：`|future[2]/prices[cursor] - 1| - (0.00005 + lev*0.000005) ≥ 0.15%`，持有 3 个交易日后平仓。
 
+### 参数扫参：三个参数里两个是死的
+
+`sim/` 目录是一套离线回放器：把 `planLookahead` / `computeExits` / `sizePosition` / `exposureScale` / `kellyFraction`
+逐行复刻成纯函数（对照 `app.game.js:724/730` 与 `fx-quant.user.js:338/948/957/1023`），
+配 2015-2026 共 3021 个交易日的 frankfurter 数据，1170 组参数在 3.8 秒内跑完。
+
+**结论一：`LOOKAHEAD_MIN_NET` 在 0.0015~0.005 区间完全无效。**
+真实游戏 26 天对照，0.0015 / 0.002 / 0.003 / 0.005 四档终值**完全相同**（14117，+41.2%）。
+因为 `bias` 是 3 天累积波动，7 个品种取最大值，几乎总是远超 0.5%；门槛直到 0.01 才开始起作用（+30.1%），0.02 直接停止交易（-0.3%）。
+
+**结论二：`LOOKAHEAD_SCALE` 完全无效。** `strength = clamp(net / scale, 0.4, 1)`，而 `net` 通常 > 0.004，
+所以 `strength` 恒为 1 —— 扫参里 scale 从 0.002 到 0.010，结果一模一样。
+
+**结论三：`LOOKAHEAD_HORIZON` 只有 3 是局部最优，但差异大半是路径噪声。**
+真实游戏 26 天对照：H=3 **+41.2%** / H=10 +39.9% / H=4 +37.7% / H=6 +36.7% / H=5 +31.1% / H=8 +20.5% / H=2 +19.2%。
+排序非单调（H=8 最差而 H=10 又回升）说明差异来自「不同 H 选到不同品种 → 不同路径」，不是稳定的 edge。保持 3。
+
+**方法论教训**：先做了 Node 复刻 + 浏览器逐日对比，结果终值差 35%（25549 vs 18922）。
+逐笔日志定位到两个偏差源：① 真实游戏里快照到达时退出尚未执行，所以 `plan` 用的是**旧持仓**；
+② `ENTRY_COOLDOWN_MS = 15000` 在 800ms/天 的自动推进下等于**约 19 天同向冷却**，复刻最初漏了它。
+两处修正后趋势一致，但绝对值仍偏高（H=1 复刻 71x vs 实测 57%）——
+**离线复刻能筛参数趋势，不能替代真实游戏验证**。
+
 ## 风控与定量
 
 **漂移引擎**两条退出路径：零交叉反手（优先，剩余持有期已负期望就换向）+ 到期平仓；外加**止损随漂移强度缩放** `clamp(0.25 + |漂移|/0.15% × 0.05, 25%, 50%)`。
@@ -190,20 +213,22 @@ if (sig && sig.side !== pos.side) { ... }
 
 ## 测试
 
-单条命令：`node run-tests.mts` —— **约 55 秒**（同样的 9 个测试串行需要 277 秒，加速 5×）。
+单条命令：`node run-tests.mts` —— **约 27 秒**（同样的 9 个测试串行需要 277 秒，加速 10×）。
 
 | 层 | 文件 | 内容 |
 |---|---|---|
 | 静态（并行，<1s） | `test-arch.mts` / `test-indicators.mts` / `test-drift-math.mts` | 8 模块互不引用与 18 条事件契约、指标与汇率换算、闭式解等价性 |
-| 浏览器（单 browser + 两批 context 并行） | `test-all.mts` | 六场景 **42 条断言**：e2e / closeall / drift / automation / replay / mobile |
+| 浏览器（单 browser + 四组 context 并行） | `test-all.mts` | 六场景 **42 条断言**：e2e / closeall / drift / automation / replay / mobile |
 
-**并行策略**（为什么是两批而不是六路全开）：
+**并行策略**（为什么是四组而不是六路全开）：
 
-- 单 `chromium.launch()` 共享浏览器进程，每个场景独立 `context`（localStorage / cookie 隔离），省掉 6 次 launch 与 6 次冷启动。
-- 分两批：`drift + automation + e2e + closeall` 并行 → `replay + mobile` 并行。**六路全并行实测会把 bilibili 壳页与游戏 iframe 加载压垮**（`net::ERR_CONNECTION_CLOSED` / 面板未挂载）。
-- 批内错峰 200ms 启动；`goto` 失败自动重试 3 次（指数退避）。
+- 单 `chromium.launch()` 共享浏览器进程；**四组各一个 context，组内 1~2 个场景共享同一 page**，省掉重复 `goto`（每次约 5s）。
+- 分组：`drift`（独占，并行下 tick 会变慢需要完整窗口）/ `automation + e2e` / `replay + closeall` / `mobile`（iPhone 视口必须独立 context）。
+- **六路全并行实测会把 bilibili 壳页与游戏 iframe 加载压垮**（`net::ERR_CONNECTION_CLOSED` / 面板未挂载），四组是稳定上限。
+- 组间错峰 300ms 启动；`goto` 失败自动重试 3 次（指数退避）。
 - 所有等待改为**条件轮询**而非固定 `sleep`：等 iframe、等面板挂载、等首次渲染、等持仓数变化。固定 8 秒在并发下必然抖动。
-- 观察窗口压缩：drift / automation 30s（原 60s）、replay 8s（原 15s）。断言改为「有交易 + 退出路径被触发」，不依赖固定样本量。
+- 组内共享 page 的副作用要显式处理：`closeall` 开头先平掉前一个场景留下的持仓。
+- 观察窗口：drift 25s（独占组）、automation 15s、replay 8s。
 
 单个 `test-e2e.mts` / `test-closeall.mts` / `test-drift.mts` / `test-automation.mts` / `test-replay.mts` / `test-mobile.mts` 保留用于细粒度调试（单独跑更快定位）。
 
@@ -222,5 +247,10 @@ if (sig && sig.side !== pos.side) { ... }
 - `test-drift.mts` / `test-drift-math.mts` — 漂移引擎行为与闭式解等价性
 - `test-e2e.mts` / `test-closeall.mts` / `test-automation.mts` — 端到端、全平、自动化与安全边界
 - `test-indicators.mts` — 指标与汇率换算（从源码抽取函数，零重复定义）
-- `probe-*.mts` — 调研用探针（性能 / 移动端 / 漂移 / 事件日历）
+- `probe-*.mts` — 调研用探针（性能 / 移动端 / 漂移 / 事件日历 / 权益曲线 / 一致性对照）
+- `sim/fetch-fx.mts` — 抓 frankfurter 2015-至今全量数据（分段 120 天，`sim/fx-history.json`）
+- `sim/engine.mts` — 引擎离线复刻（与脚本逐行对齐的纯函数，含冷却约束）
+- `sim/scan.mts` — 1170 组三维网格扫参（滚动 15 起点 × 250 天窗口）
+- `sim/validate.mts` — train / valid / game 三段样本外对照
+- `sim/compare.mts` — Node 复刻 vs 浏览器实测逐日对比（定位偏差源用）
 - `panel.png` / `mobile-after.png` — 桌面与移动端实拍
