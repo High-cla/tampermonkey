@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FX 简单! · 量化辅助台
 // @namespace    https://www.bilibilitoy.com/toy/fx-simple
-// @version      2.4.0
+// @version      2.5.0
 // @description  B站「FX 简单!」量化辅助：八模块事件驱动架构、漂移/前瞻/指标三引擎、移动端适配
 // @author       fxq
 // @match        https://www.bilibilitoy.com/toy/fx-simple/*
@@ -80,7 +80,9 @@
   const REATTACH_MS = 3000;
 
   const MIN_MARGIN = 10;
-  const STOP_RATIO = 0.40;
+  // 全参数回测（真实汇率 800 天 × 5 窗口）：0.2 的平均净利是 0.4 的 5 倍，
+  // 且 5/5 窗口都更优；止损更紧 → 周转更快 → 复利更多。0.2 = 30x 下价格反向 0.67%。
+  const STOP_RATIO = 0.20;
   const STOP_MIN = 0.25;
   const STOP_MAX = 0.50;
   const MAX_CCY_NOTIONAL_MULT = 5;
@@ -92,11 +94,15 @@
   const SIGNAL_THRESHOLD = 30;
   const SIGNAL_STRONG = 55;
   const DRIFT_MIN_BARS = 8;
-  const DRIFT_MAX_BARS = 30;
+  // 统一回测（20000 tick × 6 种子）：20 比 30 平均 +7.4% 净利、最差仍 +5.8%，
+  // 胜率 78.8%→81.2%、单笔 14.24%→15.28%。
+  const DRIFT_MAX_BARS = 20;
   const DRIFT_MIN_SUM = 0.0015;
   // 扫参结论：真实游戏 26 天对照 H=3 +41.2% / H=4 +37.7% / H=10 +39.9% / H=6 +36.7% / H=5 +31.1% / H=8 +20.5% / H=2 +19.2%。
   // H=3 最优，但 H=5~10 的排序非单调（H=8 最差、H=10 又回升）= 路径噪声，不是真实 edge。保持 3。
-  const LOOKAHEAD_HORIZON = 1;     // 回测：H=1 年化 1162% vs H=3 的 462%（周转率优先）
+  // 全参数回测（STOP=0.2，5 个窗口）：H=5 在 3/5 窗口最优、中位数最高（$233K vs H=1 的 $21K）。
+  // 注意：最优 H 在窗口间会在 1/3/5 之间跳变（路径依赖），H=5 是稳健性最好的选择而非唯一最优。
+  const LOOKAHEAD_HORIZON = 5;
   const LOOKAHEAD_SCALE = 0.004;
   const LOOKAHEAD_BOOST = 0.3;     // 前瞻与指标同向时最多放大 30%
   const LOOKAHEAD_CONFLICT = 0.4;  // 反向时把指标分数打到 40%，不反转方向
@@ -932,269 +938,311 @@
     return { init };
   }
 
-  /* ======================================================= 模块 5：engine */
+  /* ========================================================= 模块 5：engine */
+
+  // ───────── 引擎纯函数：不捕获闭包，入参显式，可独立测试 ─────────
+
+  function maxAffordable(cash, leverage) {
+    return Math.max(0, Math.floor((cash / (1 + feeRate(leverage))) * 100) / 100);
+  }
+
+  function pairCooling(book, pair, side, now, mode) {
+    const cooled = book.pairCooldown.get(pair);
+    if (!cooled) return false;
+    const cooldownMs = isDriftMode(mode) ? ENTRY_COOLDOWN_MS : ENTRY_COOLDOWN_FAST_MS;
+    return now - cooled.at < cooldownMs && cooled.side === side;
+  }
+
+  function guardNewPosition(snap, pair, side, cfg, book, now) {
+    if (snap.positions.some(p => p.pair === pair)) return false;
+    if (snap.positions.length >= cfg.maxPositions) return false;
+    if (snap.mode === 'challenge' && snap.challenge && !snap.challenge.active) return false;
+    if (snap.mode === 'challenge' && snap.positions.length >= 5) return false;
+    return !pairCooling(book, pair, side, now, snap.mode);
+  }
+
+  function sizePosition(snap, kelly, cfg, strength, weight) {
+    const equity = finite(snap.equity) ? snap.equity : snap.cash;
+    const margin = Math.min(
+      Math.max(MIN_MARGIN, Math.round(equity * kelly * strength * weight)),
+      maxAffordable(snap.cash, cfg.leverage)
+    );
+    return margin >= MIN_MARGIN ? margin : 0;
+  }
+
+  function exposureScale(snap, pair, side, margin, leverage) {
+    const [base, quote] = String(pair).split('/');
+    if (!base || !quote) return 1;
+    const map = currencyNotional(snap.positions);
+    const cap = (finite(snap.equity) ? snap.equity : snap.cash) * MAX_CCY_NOTIONAL_MULT;
+    const notional = margin * leverage;
+    let scale = 1;
+    for (const [ccy, delta] of [[base, notional * side], [quote, -notional * side]]) {
+      const cur = map.get(ccy) || 0;
+      if (Math.abs(cur + delta) <= cap) continue;
+      // 反向持仓降低敞口，放行；同向（含从零起步）按剩余额度等比缩减
+      if (cur !== 0 && Math.sign(cur) !== Math.sign(delta)) continue;
+      const allowed = Math.max(0, cap - Math.abs(cur));
+      if (Math.abs(delta) > 0) scale = Math.min(scale, allowed / Math.abs(delta));
+    }
+    return clamp(scale, 0, 1);
+  }
+
+  // 所有引擎共用一道敞口闸：首仓、同向加仓、反向对冲都走这里
+  function applyExposure(snap, plan) {
+    const scale = exposureScale(snap, plan.pair, plan.side, plan.margin, plan.leverage);
+    if (scale >= 1) return plan;
+    const margin = Math.floor(plan.margin * scale);
+    const floor = Math.max(MIN_MARGIN, Math.round((finite(snap.equity) ? snap.equity : snap.cash) * MIN_POSITION_RATIO));
+    if (margin < floor) return null;
+    return { ...plan, margin, note: plan.note + ' · 敞口' + Math.round(scale * 100) + '%' };
+  }
+
+  function activeNewsBias(news, now) {
+    if (!news) return null;
+    return now - news.at > NEWS_WINDOW_MS ? null : news;
+  }
+
+  // 前瞻只做方向确认：同向放大、反向削弱，不替换指标方向。
+  // 关键：开仓与平仓必须用同一个分数，否则「前瞻开多、指标喊跌」会立刻触发反转平仓，反复摩擦。
+  function fusedMap(ctx, cfg) {
+    const out = new Map();
+    if (!cfg.allowLookahead) return out;
+    for (const ind of ctx.ranked) {
+      const bias = lookaheadBias(ctx.getSeries(ind.pair));
+      if (bias === null) continue;
+      const dir = clamp(bias / LOOKAHEAD_SCALE, -1, 1);
+      const same = dir * ind.score >= 0;
+      const factor = same ? 1 + LOOKAHEAD_BOOST * Math.abs(dir) : LOOKAHEAD_CONFLICT;
+      out.set(ind.pair, { score: clamp(ind.score * factor, -100, 100), bias, dir, same });
+    }
+    return out;
+  }
+
+  function planDrift(snap, ctx, cfg, book, kelly, news, now) {
+    const active = activeNewsBias(news, now);
+    for (const sig of ctx.drift) {
+      if (!guardNewPosition(snap, sig.pair, sig.side, cfg, book, now)) continue;
+      let weight = 1;
+      let note = ' · 漂移' + (sig.value * 100).toFixed(2) + '%/' + sig.horizon + 't';
+      if (active?.bias[sig.pair]) {
+        const aligned = Math.sign(active.bias[sig.pair]) === sig.side;
+        weight = aligned ? 1.3 : 0.6;
+        note += aligned ? ' · 新闻顺风' : ' · 新闻逆风';
+      }
+      const strength = clamp(Math.abs(sig.value) / (DRIFT_MIN_SUM * 3), 0.5, 1);
+      const margin = sizePosition(snap, kelly, cfg, strength, weight);
+      if (!margin) continue;
+      const capped = applyExposure(snap, { pair: sig.pair, side: sig.side, margin, leverage: cfg.leverage, note });
+      if (!capped) continue;
+      const stopRatio = clamp(0.25 + Math.abs(sig.value) / DRIFT_MIN_SUM * 0.05, STOP_MIN, STOP_MAX);
+      return { ...capped, horizon: sig.horizon, score: sig.value * 10000, stopRatio };
+    }
+    return null;
+  }
+
+  // 前瞻引擎：real/battle 的价格就是 frankfurter 历史，future 是真实未来价（实测 ratio 1.000000）。
+  // 扣掉手续费后仍有净空间才开仓，持有 LOOKAHEAD_HORIZON 个交易日后无条件平。
+  function planLookahead(snap, ctx, cfg, book, kelly, now) {
+    if (!cfg.allowLookahead) return null;
+    const pairs = snap.mode === 'battle' && snap.pair ? [snap.pair] : PAIRS;
+    let best = null;
+    for (const pair of pairs) {
+      const series = ctx.getSeries(pair);
+      if (!series || series.cursor < 0 || !series.future || series.future.length < LOOKAHEAD_HORIZON) continue;
+      const at = series.prices[series.cursor];
+      const then = series.future[LOOKAHEAD_HORIZON - 1];
+      if (!finite(at) || !finite(then) || at <= 0) continue;
+      const bias = then / at - 1;
+      const fee = 0.00005 + cfg.leverage * 0.000005;
+      const net = Math.abs(bias) - fee;
+      if (net < LOOKAHEAD_MIN_NET) continue;
+      if (!best || net > best.net) best = { pair, bias, net };
+    }
+    if (!best) return null;
+    const side = best.bias > 0 ? 1 : -1;
+    if (!guardNewPosition(snap, best.pair, side, cfg, book, now)) return null;
+    const margin = sizePosition(snap, kelly, cfg, clamp(best.net / LOOKAHEAD_SCALE, 0.4, 1), 1);
+    if (!margin) return null;
+    return applyExposure(snap, {
+      pair: best.pair, side, margin, leverage: cfg.leverage,
+      score: best.bias * 10000, stopRatio: STOP_RATIO,
+      note: ' · 前瞻' + (best.bias >= 0 ? '+' : '') + (best.bias * 100).toFixed(2) + '% · 净' + (best.net * 100).toFixed(2) + '%',
+      horizon: LOOKAHEAD_HORIZON
+    });
+  }
+
+  function planIndicator(snap, ctx, cfg, book, kelly, now) {
+    const order = ctx.ranked.toSorted((a, b) => Math.abs(b.score) - Math.abs(a.score));
+    for (const ind of order) {
+      const fused = ctx.fused?.get(ind.pair) || null;
+      const score = fused ? fused.score : ind.score;
+      const note = fused ? ' · 前瞻' + (fused.bias >= 0 ? '+' : '') + (fused.bias * 100).toFixed(2) + '%' : '';
+      if (Math.abs(score) < SIGNAL_THRESHOLD) continue;
+      const side = score > 0 ? 1 : -1;
+      if (!guardNewPosition(snap, ind.pair, side, cfg, book, now)) continue;
+      const margin = sizePosition(snap, kelly, cfg, clamp(Math.abs(score) / 100, 0.4, 1), 1);
+      if (!margin) continue;
+      const capped = applyExposure(snap, { pair: ind.pair, side, margin, leverage: cfg.leverage, score, stopRatio: STOP_RATIO, note, horizon: fused ? LOOKAHEAD_HORIZON : undefined });
+      if (capped) return capped;
+    }
+    return null;
+  }
+
+  // 返回 { exits, warnings }；entryBars 的新登记与清理显式写在传入的 book 上
+  function computeExits(snap, ctx, cfg, book, barCount) {
+    const exits = [];
+    const warnings = [];
+    const driftMode = isDriftMode(snap.mode);
+    for (const pos of snap.positions) {
+      if (!book.managed.has(pos.id)) continue;   // 手动仓位不自动处置，需显式接管
+      if (!book.entryBars.has(pos.id)) book.entryBars.set(pos.id, barCount);
+      if (!finite(pos.margin) || pos.margin <= 0) {
+        if (!book.warnedIds.has(pos.id)) {
+          book.warnedIds.add(pos.id);
+          warnings.push(pos.pair + ' 缺少保证金数据，自动风控跳过（DOM 通道限制）');
+        }
+        continue;
+      }
+      const lossRatio = -pos.pnl / pos.margin;
+      const stop = book.stopRatio.get(pos.id) ?? STOP_RATIO;
+      if (lossRatio >= stop) { exits.push({ position: pos, reason: '止损' }); continue; }
+      // 到期平仓对两种引擎都生效：前瞻只看 LOOKAHEAD_HORIZON 天，到期必须走，否则利润回吐
+      const exitAt = book.exitBars.get(pos.id);
+      if (exitAt != null && barCount >= exitAt) { exits.push({ position: pos, reason: '到期' }); continue; }
+      if (driftMode) {
+        const sig = ctx.driftByPair.get(pos.pair);
+        if (sig && sig.side !== pos.side) { exits.push({ position: pos, reason: '反手' }); continue; }
+        continue;
+      }
+      if (pos.pnl > 0 && pos.pnl / pos.margin >= cfg.takeProfitRatio) { exits.push({ position: pos, reason: '止盈' }); continue; }
+      const ind = ctx.indMap.get(pos.pair);
+      if (ind && exitAt == null) {   // 前瞻仓到期前不看指标，否则真先知会被滞后指标砍掉
+        const ref = (ctx.fused?.get(pos.pair) || ind).score;
+        const against = pos.side === 1 ? ref <= -cfg.reverseExitScore : ref >= cfg.reverseExitScore;
+        if (against) { exits.push({ position: pos, reason: '反转' }); continue; }
+      }
+      if (barCount - book.entryBars.get(pos.id) >= cfg.timeStopBars && pos.pnl <= 0) {
+        exits.push({ position: pos, reason: '时间止损' });
+      }
+    }
+    const alive = new Set(snap.positions.map(p => p.id));
+    for (const id of book.entryBars.keys()) {
+      if (!alive.has(id)) { book.entryBars.delete(id); book.exitBars.delete(id); book.stopRatio.delete(id); }
+    }
+    for (const id of book.managed) if (!alive.has(id)) book.managed.delete(id);
+    for (const id of book.warnedIds) if (!alive.has(id)) book.warnedIds.delete(id);
+    return { exits, warnings };
+  }
+
+  // ───────── 引擎装配：只保留状态与编排 ─────────
 
   function createEngine(bus) {
-    const state = {
-      cfg: Object.assign({}, DEFAULTS),
-      barCount: 0,
-      tickAt: Date.now(),
-      snap: null,
+    let cfg = Object.assign({}, DEFAULTS);
+
+    // 计时类
+    const timing = { tickAt: Date.now(), barCount: 0, lastActionAt: 0, suppressUntil: 0 };
+    // 持仓记账
+    const book = {
       managed: new Set(),      // 受管持仓 id：只有脚本开出的仓位才自动退出
       warnedIds: new Set(),    // 缺少保证金数据的持仓只告警一次
       entryBars: new Map(),
       exitBars: new Map(),
       stopRatio: new Map(),
-      pairCooldown: new Map(),
-      lastActionAt: 0,
-      suppressUntil: 0,
-      news: null,
-      pending: null,
-      kellyCache: { history: null, sizeMode: null, riskPct: null, value: KELLY_DEFAULT }
+      pairCooldown: new Map()
     };
-
-    const maxAffordable = (cash, leverage) => Math.max(0, Math.floor((cash / (1 + feeRate(leverage))) * 100) / 100);
+    // 信号快照
+    const signal = { snap: null, news: null, pending: null };
 
     // history 引用未变则不重算（每轮 sizePosition 会调 1~7 次）
-    function kellyFor(history, cfg) {
-      const c = state.kellyCache;
+    let kellyCache = { history: null, sizeMode: null, riskPct: null, value: KELLY_DEFAULT };
+    function kelly(history) {
+      const c = kellyCache;
       if (c.history === history && c.sizeMode === cfg.sizeMode && c.riskPct === cfg.riskPct) return c.value;
       const value = kellyFraction(history, cfg);
-      state.kellyCache = { history, sizeMode: cfg.sizeMode, riskPct: cfg.riskPct, value };
+      kellyCache = { history, sizeMode: cfg.sizeMode, riskPct: cfg.riskPct, value };
       return value;
     }
 
-    function guardNewPosition(snap, pair, side) {
-      if (snap.positions.some(p => p.pair === pair)) return false;
-      if (snap.positions.length >= state.cfg.maxPositions) return false;
-      if (snap.mode === 'challenge' && snap.challenge && !snap.challenge.active) return false;
-      if (snap.mode === 'challenge' && snap.positions.length >= 5) return false;
-      const cooled = state.pairCooldown.get(pair);
-      const cooldownMs = isDriftMode(snap.mode) ? ENTRY_COOLDOWN_MS : ENTRY_COOLDOWN_FAST_MS;
-      return !(cooled && Date.now() - cooled.at < cooldownMs && cooled.side === side);
-    }
-
-    function sizePosition(snap, ctx, strength, weight) {
-      const equity = finite(snap.equity) ? snap.equity : snap.cash;
-      const margin = Math.min(
-        Math.max(MIN_MARGIN, Math.round(equity * kellyFor(ctx.history, state.cfg) * strength * weight)),
-        maxAffordable(snap.cash, state.cfg.leverage)
-      );
-      return margin >= MIN_MARGIN ? margin : 0;
-    }
-
-    function exposureScale(snap, pair, side, margin, leverage) {
-      const [base, quote] = String(pair).split('/');
-      if (!base || !quote) return 1;
-      const map = currencyNotional(snap.positions);
-      const cap = (finite(snap.equity) ? snap.equity : snap.cash) * MAX_CCY_NOTIONAL_MULT;
-      const notional = margin * leverage;
-      let scale = 1;
-      for (const [ccy, delta] of [[base, notional * side], [quote, -notional * side]]) {
-        const cur = map.get(ccy) || 0;
-        if (Math.abs(cur + delta) <= cap) continue;
-        // 反向持仓降低敞口，放行；同向（含从零起步）按剩余额度等比缩减
-        if (cur !== 0 && Math.sign(cur) !== Math.sign(delta)) continue;
-        const allowed = Math.max(0, cap - Math.abs(cur));
-        if (Math.abs(delta) > 0) scale = Math.min(scale, allowed / Math.abs(delta));
-      }
-      return clamp(scale, 0, 1);
-    }
-
-    // 所有引擎共用一道敞口闸：首仓、同向加仓、反向对冲都走这里
-    function applyExposure(snap, plan) {
-      const scale = exposureScale(snap, plan.pair, plan.side, plan.margin, plan.leverage);
-      if (scale >= 1) return plan;
-      const margin = Math.floor(plan.margin * scale);
-      const floor = Math.max(MIN_MARGIN, Math.round((finite(snap.equity) ? snap.equity : snap.cash) * MIN_POSITION_RATIO));
-      if (margin < floor) return null;
-      return { ...plan, margin, note: plan.note + ' · 敞口' + Math.round(scale * 100) + '%' };
-    }
-
-    function activeNewsBias() {
-      if (!state.news) return null;
-      return Date.now() - state.news.at > NEWS_WINDOW_MS ? null : state.news;
-    }
-
-    function planDrift(snap, ctx) {
-      const news = activeNewsBias();
-      for (const sig of ctx.drift) {
-        if (!guardNewPosition(snap, sig.pair, sig.side)) continue;
-        let weight = 1;
-        let note = ' · 漂移' + (sig.value * 100).toFixed(2) + '%/' + sig.horizon + 't';
-        if (news?.bias[sig.pair]) {
-          const aligned = Math.sign(news.bias[sig.pair]) === sig.side;
-          weight = aligned ? 1.3 : 0.6;
-          note += aligned ? ' · 新闻顺风' : ' · 新闻逆风';
-        }
-        const strength = clamp(Math.abs(sig.value) / (DRIFT_MIN_SUM * 3), 0.5, 1);
-        const margin = sizePosition(snap, ctx, strength, weight);
-        if (!margin) continue;
-        const capped = applyExposure(snap, { pair: sig.pair, side: sig.side, margin, leverage: state.cfg.leverage, note });
-        if (!capped) continue;
-        const stopRatio = clamp(0.25 + Math.abs(sig.value) / DRIFT_MIN_SUM * 0.05, STOP_MIN, STOP_MAX);
-        return { ...capped, horizon: sig.horizon, score: sig.value * 10000, stopRatio };
-      }
-      return null;
-    }
-
-    // 前瞻只做方向确认：同向放大、反向削弱，不替换指标方向。
-    // 关键：开仓与平仓必须用同一个分数，否则「前瞻开多、指标喊跌」会立刻触发反转平仓，反复摩擦。
-    function prepareFused(ctx) {
-      ctx.fused = new Map();
-      if (!state.cfg.allowLookahead) return;
-      for (const ind of ctx.ranked) {
-        const bias = lookaheadBias(ctx.getSeries(ind.pair));
-        if (bias === null) continue;
-        const dir = clamp(bias / LOOKAHEAD_SCALE, -1, 1);
-        const same = dir * ind.score >= 0;
-        const factor = same ? 1 + LOOKAHEAD_BOOST * Math.abs(dir) : LOOKAHEAD_CONFLICT;
-        ctx.fused.set(ind.pair, { score: clamp(ind.score * factor, -100, 100), bias, dir, same });
-      }
-    }
-
-    // 前瞻引擎：real/battle 的价格就是 frankfurter 历史，future 是真实未来价（实测 ratio 1.000000）。
-    // 扣掉手续费后仍有净空间才开仓，持有 LOOKAHEAD_HORIZON 个交易日后无条件平。
-    function planLookahead(snap, ctx) {
-      if (!state.cfg.allowLookahead) return null;
-      const pairs = snap.mode === 'battle' && snap.pair ? [snap.pair] : PAIRS;
-      let best = null;
-      for (const pair of pairs) {
-        const series = ctx.getSeries(pair);
-        if (!series || series.cursor < 0 || !series.future || series.future.length < LOOKAHEAD_HORIZON) continue;
-        const now = series.prices[series.cursor];
-        const then = series.future[LOOKAHEAD_HORIZON - 1];
-        if (!finite(now) || !finite(then) || now <= 0) continue;
-        const bias = then / now - 1;
-        const fee = 0.00005 + state.cfg.leverage * 0.000005;
-        const net = Math.abs(bias) - fee;
-        if (net < LOOKAHEAD_MIN_NET) continue;
-        if (!best || net > best.net) best = { pair, bias, net };
-      }
-      if (!best) return null;
-      const side = best.bias > 0 ? 1 : -1;
-      if (!guardNewPosition(snap, best.pair, side)) return null;
-      const margin = sizePosition(snap, ctx, clamp(best.net / LOOKAHEAD_SCALE, 0.4, 1), 1);
-      if (!margin) return null;
-      return applyExposure(snap, {
-        pair: best.pair, side, margin, leverage: state.cfg.leverage,
-        score: best.bias * 10000, stopRatio: STOP_RATIO,
-        note: ' · 前瞻' + (best.bias >= 0 ? '+' : '') + (best.bias * 100).toFixed(2) + '% · 净' + (best.net * 100).toFixed(2) + '%',
-        horizon: LOOKAHEAD_HORIZON
-      });
-    }
-
-    function planIndicator(snap, ctx) {
-      const order = ctx.ranked.toSorted((a, b) => Math.abs(b.score) - Math.abs(a.score));
-      for (const ind of order) {
-        const fused = ctx.fused?.get(ind.pair) || null;
-        const score = fused ? fused.score : ind.score;
-        const note = fused ? ' · 前瞻' + (fused.bias >= 0 ? '+' : '') + (fused.bias * 100).toFixed(2) + '%' : '';
-        if (Math.abs(score) < SIGNAL_THRESHOLD) continue;
-        const side = score > 0 ? 1 : -1;
-        if (!guardNewPosition(snap, ind.pair, side)) continue;
-        const margin = sizePosition(snap, ctx, clamp(Math.abs(score) / 100, 0.4, 1), 1);
-        if (!margin) continue;
-        const capped = applyExposure(snap, { pair: ind.pair, side, margin, leverage: state.cfg.leverage, score, stopRatio: STOP_RATIO, note, horizon: fused ? LOOKAHEAD_HORIZON : undefined });
-        if (capped) return capped;
-      }
-      return null;
-    }
-
-    function computeExits(snap, ctx) {
-      const exits = [];
-      const driftMode = isDriftMode(snap.mode);
-      for (const pos of snap.positions) {
-        if (!state.managed.has(pos.id)) continue;   // 手动仓位不自动处置，需显式接管
-        if (!state.entryBars.has(pos.id)) state.entryBars.set(pos.id, state.barCount);
-        if (!finite(pos.margin) || pos.margin <= 0) {
-          if (!state.warnedIds.has(pos.id)) {
-            state.warnedIds.add(pos.id);
-            bus.emit(EV.LOG, { msg: pos.pair + ' 缺少保证金数据，自动风控跳过（DOM 通道限制）' });
-          }
-          continue;
-        }
-        const lossRatio = -pos.pnl / pos.margin;
-        const stop = state.stopRatio.get(pos.id) ?? STOP_RATIO;
-        if (lossRatio >= stop) { exits.push({ position: pos, reason: '止损' }); continue; }
-        // 到期平仓对两种引擎都生效：前瞻只看 LOOKAHEAD_HORIZON 天，到期必须走，否则利润回吐
-        const exitAt = state.exitBars.get(pos.id);
-        if (exitAt != null && state.barCount >= exitAt) { exits.push({ position: pos, reason: '到期' }); continue; }
-        if (driftMode) {
-          const sig = ctx.driftByPair.get(pos.pair);
-          if (sig && sig.side !== pos.side) { exits.push({ position: pos, reason: '反手' }); continue; }
-          continue;
-        }
-        if (pos.pnl > 0 && pos.pnl / pos.margin >= state.cfg.takeProfitRatio) { exits.push({ position: pos, reason: '止盈' }); continue; }
-        const ind = ctx.indMap.get(pos.pair);
-        if (ind && exitAt == null) {   // 前瞻仓到期前不看指标，否则真先知会被滞后指标砍掉
-          const ref = (ctx.fused?.get(pos.pair) || ind).score;
-          const against = pos.side === 1 ? ref <= -state.cfg.reverseExitScore : ref >= state.cfg.reverseExitScore;
-          if (against) { exits.push({ position: pos, reason: '反转' }); continue; }
-        }
-        if (state.barCount - state.entryBars.get(pos.id) >= state.cfg.timeStopBars && pos.pnl <= 0) {
-          exits.push({ position: pos, reason: '时间止损' });
-        }
-      }
-      const alive = new Set(snap.positions.map(p => p.id));
-      for (const id of state.entryBars.keys()) {
-        if (!alive.has(id)) {
-          state.entryBars.delete(id);
-          state.exitBars.delete(id);
-          state.stopRatio.delete(id);
-        }
-      }
-      for (const id of state.managed) if (!alive.has(id)) state.managed.delete(id);
-      for (const id of state.warnedIds) if (!alive.has(id)) state.warnedIds.delete(id);
-      return exits;
-    }
-
     function onSeries({ snap, ctx }) {
-      state.snap = snap;
-      prepareFused(ctx);
-      const exits = computeExits(snap, ctx);
+      signal.snap = snap;
+      ctx.fused = fusedMap(ctx, cfg);
+      const now = Date.now();
+      const { exits, warnings } = computeExits(snap, ctx, cfg, book, timing.barCount);
+      for (const msg of warnings) bus.emit(EV.LOG, { msg });
       if (exits.length) bus.emit(EV.ENGINE_EXITS, { exits });
-      const plan = isDriftMode(snap.mode) ? planDrift(snap, ctx) : (planLookahead(snap, ctx) || planIndicator(snap, ctx));
-      state.pending = plan;
+      const k = kelly(ctx.history);
+      const plan = isDriftMode(snap.mode)
+        ? planDrift(snap, ctx, cfg, book, k, signal.news, now)
+        : (planLookahead(snap, ctx, cfg, book, k, now) || planIndicator(snap, ctx, cfg, book, k, now));
+      signal.pending = plan;
       bus.emit(EV.ENGINE_PLAN, { plan });
     }
 
     // 显式接管：把当前所有持仓纳入自动风控（手动仓位默认不受管）
     function adoptAll() {
       let added = 0;
-      for (const pos of state.snap?.positions || []) {
-        if (state.managed.has(pos.id)) continue;
-        state.managed.add(pos.id);
+      for (const pos of signal.snap?.positions || []) {
+        if (book.managed.has(pos.id)) continue;
+        book.managed.add(pos.id);
         added++;
       }
       bus.emit(EV.LOG, { msg: '接管 ' + added + ' 笔持仓，纳入自动风控' });
       return added;
     }
 
+    // debug.state 保持「活对象」语义：读拿当前值，写直接落到内部状态
+    const debugState = {};
+    const link = (name, get, set) => Object.defineProperty(debugState, name, { get, set, enumerable: true, configurable: true });
+    link('cfg', () => cfg, v => { cfg = v; });
+    link('tickAt', () => timing.tickAt, v => { timing.tickAt = v; });
+    link('barCount', () => timing.barCount, v => { timing.barCount = v; });
+    link('lastActionAt', () => timing.lastActionAt, v => { timing.lastActionAt = v; });
+    link('suppressUntil', () => timing.suppressUntil, v => { timing.suppressUntil = v; });
+    link('snap', () => signal.snap, v => { signal.snap = v; });
+    link('news', () => signal.news, v => { signal.news = v; });
+    link('pending', () => signal.pending, v => { signal.pending = v; });
+    link('managed', () => book.managed, v => { book.managed = v; });
+    link('warnedIds', () => book.warnedIds, v => { book.warnedIds = v; });
+    link('entryBars', () => book.entryBars, v => { book.entryBars = v; });
+    link('exitBars', () => book.exitBars, v => { book.exitBars = v; });
+    link('stopRatio', () => book.stopRatio, v => { book.stopRatio = v; });
+    link('pairCooldown', () => book.pairCooldown, v => { book.pairCooldown = v; });
+    link('kellyCache', () => kellyCache, v => { kellyCache = v; });
+
     function init() {
-      bus.on(EV.CONFIG_CHANGED, ({ cfg }) => { state.cfg = cfg; });
-      bus.on(EV.DATA_BAR, ({ at, count }) => { state.tickAt = at; state.barCount = count; });
-      bus.on(EV.NEWS_CHANGED, ({ news }) => { state.news = news; });
+      bus.on(EV.CONFIG_CHANGED, ({ cfg: next }) => { cfg = next; });
+      bus.on(EV.DATA_BAR, ({ at, count }) => { timing.tickAt = at; timing.barCount = count; });
+      bus.on(EV.NEWS_CHANGED, ({ news }) => { signal.news = news; });
       bus.on(EV.SERIES_READY, onSeries);
       bus.on(EV.EXEC_OPENED, ({ position, plan }) => {
         if (!position) return;
-        state.managed.add(position.id);
-        if (plan.horizon != null) state.exitBars.set(position.id, state.barCount + plan.horizon);
-        state.stopRatio.set(position.id, plan.stopRatio || STOP_RATIO);
-        state.lastActionAt = Date.now();
+        book.managed.add(position.id);
+        if (plan.horizon != null) book.exitBars.set(position.id, timing.barCount + plan.horizon);
+        book.stopRatio.set(position.id, plan.stopRatio || STOP_RATIO);
+        timing.lastActionAt = Date.now();
       });
       bus.on(EV.EXEC_CLOSED, ({ position }) => {
         if (!position) return;
-        state.pairCooldown.set(position.pair, { at: Date.now(), side: position.side });
+        book.pairCooldown.set(position.pair, { at: Date.now(), side: position.side });
       });
       bus.on(EV.UI_COMMAND, ({ cmd, value }) => {
-        if (cmd === 'suppress') state.suppressUntil = Date.now() + (value || SUPPRESS_MS);
-        if (cmd === 'action') state.lastActionAt = Date.now();
+        if (cmd === 'suppress') timing.suppressUntil = Date.now() + (value || SUPPRESS_MS);
+        if (cmd === 'action') timing.lastActionAt = Date.now();
         if (cmd === 'adopt') adoptAll();
       });
       return {
         dispose() {},
-        debug: { state, computeExits, planDrift, planIndicator, adoptAll, get pending() { return state.pending; } }
+        debug: {
+          // 对外签名保持 (snap, ctx)，backtest / test-contract 无需改动
+          state: debugState,
+          computeExits: (snap, ctx) => computeExits(snap, ctx, cfg, book, timing.barCount).exits,
+          planDrift: (snap, ctx) => planDrift(snap, ctx, cfg, book, kelly(ctx.history), signal.news, Date.now()),
+          planLookahead: (snap, ctx) => planLookahead(snap, ctx, cfg, book, kelly(ctx.history), Date.now()),
+          planIndicator: (snap, ctx) => planIndicator(snap, ctx, cfg, book, kelly(ctx.history), Date.now()),
+          adoptAll,
+          get pending() { return signal.pending; }
+        }
       };
     }
 
@@ -1887,7 +1935,7 @@
         if (!PAGE.document.body) { bootTimer = setTimeout(boot, 60); return; }
         if (!$('longBtn')) { if (++waits < 100) { bootTimer = setTimeout(boot, 150); return; } }
         build();
-        log('量化辅助台已就绪 v2.4.0（八模块 · MAIN_WORLD）');
+        log('量化辅助台已就绪 v2.5.0（八模块 · MAIN_WORLD）');
       };
       const stopBoot = () => { if (bootTimer) clearTimeout(bootTimer); bootTimer = null; };
       if (PAGE.document.readyState === 'loading') PAGE.document.addEventListener('DOMContentLoaded', boot, { once: true });

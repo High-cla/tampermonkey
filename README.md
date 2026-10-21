@@ -1,4 +1,4 @@
-# FX 简单! · 量化辅助台 v2.4.0
+# FX 简单! · 量化辅助台 v2.5.0
 
 B站小游戏「FX 简单!」(<https://www.bilibili.com/toy/fx-simple/index.html>) 的 Tampermonkey 辅助脚本。
 **模拟盘游戏**，不接任何真实资金。桌面（Chrome / Edge）与 Android（Chromium + Tampermonkey）通用。
@@ -10,6 +10,7 @@ v2.1 按单一职责把 Data（301 行）拆成 **data**（快照+触发源）�
 
 v2.3 只动边界、不动交易阈值：未来数据隔离、配置启动顺序、统一敞口闸、开仓回读核验、受管仓位范围。
 v2.4 补生命周期：模块可卸载、在途请求可取消、异步工具接口明确失败。
+v2.5 按全参数回测调整三个默认值：`STOP_RATIO` 0.40→0.20、`LOOKAHEAD_HORIZON` 1→5、`DRIFT_MAX_BARS` 30→20。
 
 | 模块 | 行数 | 职责 |
 |---|---|---|
@@ -129,7 +130,7 @@ DOM 一变即采集（对齐游戏的 1.5s tick）；另有 500ms 定时兜底 �
 3. **没有到期平仓**：前瞻看 3 天，但唯一持有期约束是 `timeStopBars = 20` 且只在亏损时触发 → 3 天后利润回吐。
    改为 `exitBars = barCount + horizon`，到期无条件平，且到期前跳过指标反转判据（否则真先知被滞后指标砍掉）。
 
-前瞻引擎开仓条件：`|future[H-1]/prices[cursor] - 1| - (0.00005 + lev*0.000005) ≥ 0.05%`，持有 `LOOKAHEAD_HORIZON` 个交易日后**无条件**平仓（当前 H=1）。
+前瞻引擎开仓条件：`|future[H-1]/prices[cursor] - 1| - (0.00005 + lev*0.000005) ≥ 0.05%`，持有 `LOOKAHEAD_HORIZON` 个交易日后**无条件**平仓（当前 H=5）。
 
 ### 参数扫参：前瞻三参数里两个在回测中无效
 
@@ -181,11 +182,11 @@ DOM 一变即采集（对齐游戏的 1.5s tick）；另有 500ms 定时兜底 �
 
 | 常量 | 值 | 作用 |
 |---|---|---|
-| `STOP_RATIO` | 0.40 | 止损线（漂移仓按强度在 0.25~0.50 间动态） |
+| `STOP_RATIO` | **0.20** | 止损线（漂移仓按强度在 0.25~0.50 间动态）；全参数回测：0.2 的平均净利是 0.4 的 5 倍，5/5 窗口更优 |
 | `STOP_MIN` / `STOP_MAX` | 0.25 / 0.50 | 漂移仓动态止损区间，上限避开游戏 0.6 冻结线 |
 | `DRIFT_MIN_SUM` | 0.0015 | 漂移累积开仓阈值 |
-| `DRIFT_MIN_BARS` / `DRIFT_MAX_BARS` | 8 / 30 | 持有期搜索范围 |
-| `LOOKAHEAD_HORIZON` | 1 | 前瞻天数。**两处实验结论冲突**：2 年 oracle 回测 H=1 年化 1162% > H=3 的 462%；真实游戏 26 天对照 H=3 +41.2% > H=2 +19.2%（H=1 未测）。当前取 1，待同引擎回测后再定 |
+| `DRIFT_MIN_BARS` / `DRIFT_MAX_BARS` | 8 / **20** | 持有期搜索范围；统一回测：20 比 30 平均 +7.4%、最差仍 +5.8% |
+| `LOOKAHEAD_HORIZON` | **5** | 前瞻天数。全参数回测（STOP=0.2，5 窗口）：H=5 中位数最高（$233K vs H=1 的 $21K）、3/5 窗口最优。最优 H 会在 1/3/5 间跳变，属路径依赖 |
 | `LOOKAHEAD_MIN_NET` | 0.0005 | 前瞻扣费后最小净空间（回测：0.05% 年化 1425%，0.15% 只有 1162%） |
 | `ENTRY_COOLDOWN_MS` / `_FAST_MS` | 15000 / 1000 | 同品种同向重进冷却：sim 1.5s/tick 用 15s，real 800ms/天用 1s |
 | `LOOKAHEAD_BOOST` / `LOOKAHEAD_CONFLICT` | 0.3 / 0.4 | 前瞻与指标同向放大 / 反向削弱 |
@@ -268,7 +269,56 @@ DOM 一变即采集（对齐游戏的 1.5s tick）；另有 500ms 定时兜底 �
 - **minSum 0.0015 → 0.005**：平均 +6.0%，最差 +3.4%，6/6 为正。
 - **两者同时改**：只剩 +1.0%——效果重叠，都在过滤低质量信号，叠加没有额外收益。
 
-**结论：`DRIFT_MAX_BARS = 20` 是唯一值得考虑的改动**（+7.4% 且最差情形仍 +5.8%）。但它改的是默认交易行为，代码里仍是 30，是否应用由使用者决定。
+**结论：`DRIFT_MAX_BARS = 20` 是唯一值得考虑的改动**（+7.4% 且最差情形仍 +5.8%）。**v2.5 已应用。**
+
+### 全参数回测（真实汇率 3021 天）
+
+`backtest-params-all.mts` 用 `sim/fx-history.json`（2014-12-31 ~ 2026-10-19，7 品种日线），
+决策与结算同样来自脚本本身，单变量扫描每个参数。回测窗口 800 天 × 5 个起始点。
+
+**有效且已调整：**
+
+| 参数 | 旧 → 新 | 证据 |
+|---|---|---|
+| `STOP_RATIO` | 0.40 → **0.20** | 5 个窗口平均净利 $11.4K → $56.8K（**5 倍**），5/5 窗口更优；0.2 = 30x 下价格反向 0.67% |
+| `LOOKAHEAD_HORIZON` | 1 → **5** | 中位净利 $21K → $233K；3/5 窗口最优。最优 H 会在 1/3/5 间跳变（路径依赖），H=5 是稳健性最好的选择而非唯一最优 |
+| `DRIFT_MAX_BARS` | 30 → **20** | 统一回测 6 种子平均 +7.4%，胜率 78.8%→81.2% |
+
+**有效但未改（与其它引擎冲突）：**
+
+| 参数 | 指标引擎 | 前瞻引擎 | 结论 |
+|---|---|---|---|
+| `maxPositions` | 1 最优（-$2.2K vs 4 仓 -$6.7K） | 4 最优（$10.8K vs 1 仓 $2.9K） | 冲突，保持 4 |
+| `MAX_CCY_NOTIONAL_MULT` | 1 最优（-$3.6K vs 5x -$6.7K） | 5 最优（$10.8K vs 1x $5.1K） | 冲突，保持 5 |
+| `leverage` | 越低越好 | 50x 最优（$24.5K vs 30x $10.8K） | 冲突，保持 30 |
+
+**完全无效（改了等于没改）：**
+
+| 参数 | 现象 | 原因 |
+|---|---|---|
+| `takeProfitRatio` / `reverseExitScore` / `timeStopBars` | 指标引擎 6 个取值结果**完全相同** | 30x 杠杆下价格反向 1.33% 就触发止损，而止损在 `computeExits` 里是第一个判断，后面三个分支永远走不到 |
+| `LOOKAHEAD_MIN_NET` | 0 ~ 0.003 结果完全相同 | `\|bias\|` 总是远超门槛，过滤从未生效 |
+| `LOOKAHEAD_SCALE` | 0.002~0.008 差异 <3% | `strength` 被 clamp 在 [0.4, 1]，scale 影响被吃掉 |
+| `KELLY_FRACTION` / `KELLY_MIN_SAMPLE` | 4 个取值结果完全相同 | 指标引擎期望为负 → 凯利算出来是负数 → 被 `clamp(…, 0.08, 0.25)` 强制成下限 0.08，系数怎么乘都还是负 |
+| `MIN_BARS_FOR_SIGNAL` | 20~90 结果完全相同 | 序列长度远超 90，门槛从未卡住 |
+
+**一个设计缺陷：**`kellyFraction` 在期望为负时返回 `clamp(负值, 0.08, 0.25)` = **0.08**，
+即「明知是负期望，仍强制用 8% 权益开仓」。正确行为应该是返回 0（停止交易）。这一条没有改，因为会改变默认交易行为，需要单独决策。
+
+**指标引擎的结论：**在真实汇率 + 30x 杠杆下，任何参数组合都是负收益（最好 -$2.2K / 800 天）。
+面板上的止盈 / 反转 / 时间止损三个参数对它**完全无效**。它只适合作为没有 drift / 前瞻数据时的兜底，且应当把并发降到 1。
+
+**前瞻引擎的多窗口细节（STOP=0.2）：**
+
+| 窗口起点 | H=1 | H=3 | H=5 |
+|---|---|---|---|
+| 2016-03-03 | $21,018 | $180,032 | **$325,577** |
+| 2018-02-14 | **$63,022** | $26,507 | $25,135 |
+| 2020-01-31 | $175,266 | **$1,696,533** | $56,235 |
+| 2022-01-11 | $21,780 | $121,069 | **$838,342** |
+| 2023-08-02 | $4,314 | $104,478 | **$233,018** |
+
+H=5 赢 3 个窗口、H=1 和 H=3 各赢 1 个。**没有任何 H 在所有窗口都最优**——这正是「参数扫参只能看趋势，不能当承诺」的实证。
 
 另外两个由统一回测暴露的事实：
 
@@ -403,6 +453,8 @@ Chromium 138+ 起，MV3 扩展调用 `chrome.userScripts` 需要用户在扩展�
 - **真实 TM 注入依赖手动开启 `Allow User Scripts`**：自动化无法代劳（改偏好文件会被完整性校验回退）。未开启时脚本在真实浏览器里完全不运行，且没有任何报错。
 - 本机实测：TM 的 `Local Extension Settings` 里只有 LevelDB 骨架、无数据文件，说明此前从未真正加载过任何用户脚本。
 - `test-indicators.mts` 会请求 frankfurter，属**网络契约测试**，不是纯离线。
+- **指标引擎在 30x 杠杆下三参数失效**：`takeProfitRatio` / `reverseExitScore` / `timeStopBars` 全部走不到，因为止损总是先触发。降低杠杆才会让它们生效。
+- **凯利在负期望时仍强制 8% 仓位**：`clamp(f*, 0.08, 0.25)` 的下限会在期望为负时强制开仓，未改。
 
 ## 文件
 
@@ -424,3 +476,81 @@ Chromium 138+ 起，MV3 扩展调用 `chrome.userScripts` 需要用户在扩展�
 - `sim/validate.mts` — train / valid / game 三段样本外对照
 - `sim/compare.mts` — Node 复刻 vs 浏览器实测逐日对比（定位偏差源用）
 - `panel.png` / `mobile-after.png` — 桌面与移动端实拍
+---
+
+## 架构调优记录（v2.5.0 之后，纯重构）
+
+用 ast-grep 0.42.3 + codebase-memory 代码图审计后重构 `createEngine`。**行为零变化**：
+`backtest-unified.mts 20000 1000` 输出逐位一致（4411 笔 / 胜率 81.2% / 单笔 15.28% / 净利 $647,495 / 回撤 4.8%）。
+
+### 问题
+
+`createEngine` 是 266 行闭包，内含 14 个函数共享一块 16 字段的可变 `state`。
+代价是 **`engine-core.mts` 必须用 `runInNewContext` 启动整个 88 KB 脚本**（配全套 DOM/时钟/存储桩）
+才能调用 `planDrift` / `computeExits`。
+
+### 改动
+
+**P0 — 纯函数提到模块级**（不捕获闭包，入参显式）：
+
+| 函数 | 签名 |
+|---|---|
+| `maxAffordable` | `(cash, leverage)` |
+| `pairCooling` | `(book, pair, side, now, mode)` |
+| `guardNewPosition` | `(snap, pair, side, cfg, book, now)` |
+| `sizePosition` | `(snap, kelly, cfg, strength, weight)` |
+| `exposureScale` / `applyExposure` | `(snap, ...)` |
+| `activeNewsBias` | `(news, now)` |
+| `fusedMap` | `(ctx, cfg)` → 返回新 Map |
+| `planDrift` / `planLookahead` / `planIndicator` | `(snap, ctx, cfg, book, kelly, ...)` |
+| `computeExits` | `(snap, ctx, cfg, book, barCount)` → `{ exits, warnings }` |
+
+**P1 — 状态分组**：
+
+```
+let cfg                                  // 配置
+const timing = { tickAt, barCount, lastActionAt, suppressUntil }
+const book   = { managed, warnedIds, entryBars, exitBars, stopRatio, pairCooldown }
+const signal = { snap, news, pending }
+let kellyCache
+```
+
+### 结果（代码图实测）
+
+| 指标 | 重构前 | 重构后 |
+|---|---|---|
+| `createEngine` 行数 | 266 | **111** |
+| `createEngine` complexity | 63 | **11** |
+| `createEngine` cognitive | **98** | **12** |
+| 高复杂度函数（cx≥8）数量 | 12 | **10** |
+| `sizePosition` / `guardNewPosition` / `applyExposure` | 闭包内不可达 | 模块级纯函数 |
+
+`debug` 面对外签名保持 `(snap, ctx)` 不变，`backtest-unified` / `backtest-params-all` / `test-contract` 零改动。
+`debug.state` 改为访问器门面，保持「活对象」读写语义（测试会往里写 `cfg` / `snap`）。
+
+### 未做
+
+**P2 双通道桥未动**：确认 fx-simple 仍在线（iframe 200 / app.js 101 KB / `longBtn` 存在），
+script 通道与 direct 通道都有实际价值，不做简化。
+
+`createUi` 361 行 / `createExec` 193 行 / `createSeries` 181 行 / `createBridge` 162 行未动——
+内部已是 30+ 个小函数，拆出去只增加间接层。
+
+### 顺带修复
+
+项目缺 `node_modules`，`playwright-core` 解析失败导致 20 个浏览器测试全部无法运行。
+已建 junction 指向 `@playwright/mcp/node_modules/playwright-core`，测试套件恢复。
+
+### 回归
+
+```
+test-arch          ARCH ALL PASS
+test-contract      CONTRACT ALL PASS
+test-drift-math    DRIFT-MATH ALL PASS
+test-indicators    ALL PASS
+test-automation    AUTOMATION ALL PASS   (70.3s，与重构前 70.3s 一致)
+backtest-unified   数字逐位一致
+```
+
+`test-all.mts`（4 context 并行）在新旧版本上都会偶发失败（`replay`/`closeall` 同组、`drift` 敞口），
+属既有并发抖动，与本次重构无关。
