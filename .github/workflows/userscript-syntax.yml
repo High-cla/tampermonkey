@@ -1,0 +1,31 @@
+name: Userscript syntax
+
+on:
+  pull_request:
+    paths:
+      - "a-share.user.js"
+      - "fx-kurumi.user.js"
+      - "fx-quant.user.js"
+      - ".github/workflows/userscript-syntax.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: Check userscript syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Parse all userscripts
+        run: |
+          set -eu
+          node --check a-share.user.js
+          node --check fx-kurumi.user.js
+          node --check fx-quant.user.js
