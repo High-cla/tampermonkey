@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FX 简单! · 量化辅助台
 // @namespace    https://www.bilibilitoy.com/toy/fx-simple
-// @version      2.5.0
+// @version      2.5.1
 // @description  B站「FX 简单!」量化辅助：八模块事件驱动架构、漂移/前瞻/指标三引擎、移动端适配
 // @author       fxq
 // @match        https://www.bilibilitoy.com/toy/fx-simple/*
@@ -10,7 +10,7 @@
 // ==/UserScript==
 
 /* ============================================================================
- * FX 简单! 量化辅助台 v2.1.0
+ * FX 简单! 量化辅助台 v2.5.1
  *
  * 架构：一个总线实例 + 八个互不引用的模块（按单一职责切分）。
  *   - 模块之间零直接调用，只经 bus.emit / bus.on 通信，事件名即契约（EV 常量）。
@@ -233,15 +233,15 @@
     return out;
   }
 
-  function rsiLast(values, period) {
-    if (values.length < period + 1) return null;
+  function rsiLast(values, period, end = values.length) {
+    if (end < period + 1) return null;
     let gain = 0, loss = 0;
     for (let i = 1; i <= period; i++) {
       const d = values[i] - values[i - 1];
       if (d >= 0) gain += d; else loss -= d;
     }
     gain /= period; loss /= period;
-    for (let i = period + 1; i < values.length; i++) {
+    for (let i = period + 1; i < end; i++) {
       const d = values[i] - values[i - 1];
       gain = (gain * (period - 1) + (d > 0 ? d : 0)) / period;
       loss = (loss * (period - 1) + (d < 0 ? -d : 0)) / period;
@@ -250,21 +250,28 @@
     return 100 - 100 / (1 + gain / loss);
   }
 
-  function atrOf(candles, period) {
-    if (candles.length < period + 1) return null;
+  function atrOf(candles, period, end = candles.length) {
+    if (end < period + 1) return null;
     let sum = 0;
-    for (let i = candles.length - period; i < candles.length; i++) {
+    for (let i = end - period; i < end; i++) {
       const c = candles[i], p = candles[i - 1];
       sum += Math.max(c.h - c.l, Math.abs(c.h - p.c), Math.abs(c.l - p.c));
     }
     return sum / period;
   }
 
-  function bollinger(values, period, mult) {
-    if (values.length < period) return null;
-    const slice = values.slice(-period);
-    const mean = slice.reduce((a, b) => a + b, 0) / period;
-    const sd = Math.sqrt(slice.reduce((a, b) => a + (b - mean) * (b - mean), 0) / period);
+  function bollinger(values, period, mult, end = values.length) {
+    if (end < period) return null;
+    const start = end - period;
+    let sum = 0;
+    for (let i = start; i < end; i++) sum += values[i];
+    const mean = sum / period;
+    let sumSq = 0;
+    for (let i = start; i < end; i++) {
+      const d = values[i] - mean;
+      sumSq += d * d;
+    }
+    const sd = Math.sqrt(sumSq / period);
     return { mid: mean, upper: mean + mult * sd, lower: mean - mult * sd };
   }
 
@@ -276,21 +283,38 @@
   }
 
   function computeIndicators(series, pair) {
-    const view = historyView(series);
-    if (!view || view.prices.length < MIN_BARS_FOR_SIGNAL) return null;
-    const prices = view.prices;
-    const last = prices.at(-1);
-    const ema12 = emaSeries(prices, IND.EMA_FAST);
-    const ema26 = emaSeries(prices, IND.EMA_SLOW);
-    const e12 = ema12.at(-1);
-    const e26 = ema26.at(-1);
-    const macdLine = ema12.map((v, i) => v - ema26[i]);
-    const macdSignal = emaSeries(macdLine.slice(-IND.MACD_WINDOW), IND.MACD_SIGNAL);
-    const macdHist = macdLine.at(-1) - macdSignal.at(-1);
-    const rsi14 = rsiLast(prices, IND.RSI);
-    const atr14 = atrOf(view.candles, IND.ATR);
-    const boll = bollinger(prices, IND.BOLL, IND.BOLL_MULT);
-    const roc10 = prices.length > IND.ROC ? (last / prices[prices.length - (IND.ROC + 1)] - 1) : 0;
+    if (!series || !Array.isArray(series.prices)) return null;
+    const prices = series.prices;
+    // 直接用 end 索引限定历史前缀，避免每次回放都复制整段 prices/candles。
+    const end = series.cursor >= 0 ? Math.min(series.cursor + 1, prices.length) : prices.length;
+    if (end < MIN_BARS_FOR_SIGNAL) return null;
+    const candles = Array.isArray(series.candles) ? series.candles : [];
+    const candleEnd = Math.min(end, candles.length);
+    const last = prices[end - 1];
+
+    // 一趟扫描同时维护快慢 EMA，只保留 MACD signal 实际使用的尾部窗口。
+    const fastK = 2 / (IND.EMA_FAST + 1);
+    const slowK = 2 / (IND.EMA_SLOW + 1);
+    const macdStart = Math.max(0, end - IND.MACD_WINDOW);
+    const macdTail = new Array(end - macdStart);
+    let e12 = prices[0], e26 = prices[0];
+    for (let i = 0; i < end; i++) {
+      if (i > 0) {
+        e12 = prices[i] * fastK + e12 * (1 - fastK);
+        e26 = prices[i] * slowK + e26 * (1 - slowK);
+      }
+      if (i >= macdStart) macdTail[i - macdStart] = e12 - e26;
+    }
+    const signalK = 2 / (IND.MACD_SIGNAL + 1);
+    let macdSignal = macdTail[0];
+    for (let i = 1; i < macdTail.length; i++)
+      macdSignal = macdTail[i] * signalK + macdSignal * (1 - signalK);
+    const macdHist = e12 - e26 - macdSignal;
+
+    const rsi14 = rsiLast(prices, IND.RSI, end);
+    const atr14 = atrOf(candles, IND.ATR, candleEnd);
+    const boll = bollinger(prices, IND.BOLL, IND.BOLL_MULT, end);
+    const roc10 = end > IND.ROC ? (last / prices[end - (IND.ROC + 1)] - 1) : 0;
     const atrPct = atr14 && last ? atr14 / last : 0;
     const bollPos = boll && boll.upper > boll.lower ? (last - boll.lower) / (boll.upper - boll.lower) : 0.5;
 
@@ -356,13 +380,19 @@
   // 纯函数：给定 history 与 cfg 求半凯利比例（调用方负责按引用记忆化）
   function kellyFraction(history, cfg) {
     if (cfg.sizeMode !== SIZE_MODE.KELLY) return cfg.riskPct;
-    const settled = Array.isArray(history) ? history.filter(h => !h.liquidated) : [];
-    if (settled.length < KELLY_MIN_SAMPLE) return KELLY_DEFAULT;
-    const wins = settled.filter(h => h.pnl > 0);
-    const losses = settled.filter(h => h.pnl <= 0);
-    const p = wins.length / settled.length;
-    const avgWin = wins.length ? wins.reduce((a, h) => a + h.pnl, 0) / wins.length : 1;
-    const avgLoss = losses.length ? Math.abs(losses.reduce((a, h) => a + h.pnl, 0) / losses.length) : 1;
+    let settled = 0, wins = 0, losses = 0, winSum = 0, lossSum = 0;
+    if (Array.isArray(history)) {
+      for (const trade of history) {
+        if (trade.liquidated) continue;
+        settled++;
+        if (trade.pnl > 0) { wins++; winSum += trade.pnl; }
+        else { losses++; lossSum += trade.pnl; }
+      }
+    }
+    if (settled < KELLY_MIN_SAMPLE) return KELLY_DEFAULT;
+    const p = wins / settled;
+    const avgWin = wins ? winSum / wins : 1;
+    const avgLoss = losses ? Math.abs(lossSum / losses) : 1;
     const b = avgLoss > 0 ? avgWin / avgLoss : 1;
     return clamp((p - (1 - p) / b) * KELLY_FRACTION, 0.08, 0.25);
   }
@@ -765,6 +795,8 @@
       historyCache: new Map(),
       seriesCache: new Map(),
       indCache: new Map(),
+      simCache: new Map(),
+      sampleCache: new Map(),
       tickAt: Date.now(),
       abort: new AbortController()
     };
@@ -780,15 +812,34 @@
     function simSeries(pair) {
       const node = state.bridge?.readSave()?.sim?.[pair];
       if (!node || !Array.isArray(node.candles) || node.candles.length < 10) return null;
-      const candles = node.candles.map(k => ({ o: k.open, h: k.high, l: k.low, c: k.close }));
-      return { candles, prices: candles.map(k => k.c), source: '游戏存档K线 ' + candles.length + ' 根', future: null, cursor: -1 };
+      const source = node.candles;
+      const cached = state.simCache.get(pair);
+      if (cached && cached.source === source) return cached.series;
+      const candles = new Array(source.length);
+      const prices = new Array(source.length);
+      for (let i = 0; i < source.length; i++) {
+        const k = source[i];
+        const candle = { o: k.open, h: k.high, l: k.low, c: k.close };
+        candles[i] = candle;
+        prices[i] = candle.c;
+      }
+      const series = { candles, prices, source: '游戏存档K线 ' + candles.length + ' 根', future: null, cursor: -1 };
+      state.simCache.set(pair, { source, series });
+      return series;
     }
 
     function sampledSeries(pair) {
       const buf = state.sampled.get(pair);
       if (!buf || buf.length < SAMPLE_MIN) return null;
-      const prices = buf.map(p => p.c);
-      return { candles: candlesFromPrices(prices), prices, source: '实时采样 ' + prices.length + ' 点', future: null, cursor: -1 };
+      const first = buf[0], last = buf[buf.length - 1];
+      const cached = state.sampleCache.get(pair);
+      if (cached && cached.buffer === buf && cached.length === buf.length
+        && cached.firstAt === first.t && cached.lastAt === last.t && cached.lastPrice === last.c) return cached.series;
+      const prices = new Array(buf.length);
+      for (let i = 0; i < buf.length; i++) prices[i] = buf[i].c;
+      const series = { candles: candlesFromPrices(prices), prices, source: '实时采样 ' + prices.length + ' 点', future: null, cursor: -1 };
+      state.sampleCache.set(pair, { buffer: buf, length: buf.length, firstAt: first.t, lastAt: last.t, lastPrice: last.c, series });
+      return series;
     }
 
     function recordSample(snap) {
@@ -873,16 +924,19 @@
     // 三元组比较替代字符串键，省掉每轮 7 次字符串拼接
     function cachedIndicators(series, pair, mode) {
       if (!series) return null;
-      const view = historyView(series);
-      if (!view || !view.prices.length) return null;
-      const n = view.prices.length;
-      const last = view.prices[n - 1];
+      if (!Array.isArray(series.prices)) return null;
+      const n = series.cursor >= 0 ? Math.min(series.cursor + 1, series.prices.length) : series.prices.length;
+      if (!n) return null;
+      const last = series.prices[n - 1];
       const cursor = series.cursor ?? -1;
+      const pricesRef = series.prices, candlesRef = series.candles;
       const key = mode + '|' + pair;
       const hit = state.indCache.get(key);
-      if (hit && hit.n === n && hit.last === last && hit.cursor === cursor) return hit.ind;
+      // 引用变化也会失效缓存：防止相同长度/末价但历史前缀已替换时读到旧评分。
+      if (hit && hit.n === n && hit.last === last && hit.cursor === cursor
+        && hit.pricesRef === pricesRef && hit.candlesRef === candlesRef) return hit.ind;
       const ind = computeIndicators(series, pair);
-      state.indCache.set(key, { n, last, cursor, ind });
+      state.indCache.set(key, { n, last, cursor, pricesRef, candlesRef, ind });
       return ind;
     }
 

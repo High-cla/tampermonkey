@@ -1,7 +1,19 @@
-# FX 简单! · 量化辅助台 v2.5.0
+# FX 简单! · 量化辅助台 v2.5.1
 
 B站小游戏「FX 简单!」(<https://www.bilibili.com/toy/fx-simple/index.html>) 的 Tampermonkey 辅助脚本。
 **模拟盘游戏**，不接任何真实资金。桌面（Chrome / Edge）与 Android（Chromium + Tampermonkey）通用。
+
+## 仓库中的三个独立脚本
+
+三个 userscript 可分别安装，互不依赖。下面版本来自各文件的 `@version`：
+
+| 脚本 | 当前版本 | 页面 / 主要职责 |
+|---|---:|---|
+| `fx-quant.user.js` | 2.5.1 | FX 简单!：漂移、回放前瞻、技术指标、敞口风控与移动面板 |
+| `fx-kurumi.user.js` | 0.3.1 | FX Kurumi：行情采集、配对回归、方向性信号与账户/租金风控 |
+| `a-share.user.js` | 3.9.1 | 大A 简单!：限价做市、订单状态机、撤单/止损与行情 WebSocket |
+
+本 README 后续的架构、指标、回测和参数说明主要针对 **FX 简单!（`fx-quant.user.js`）**，不是另外两个脚本的策略规格。三个脚本的交易阈值和策略参数彼此独立。
 
 ## 架构：一个总线 + 八个互不引用的模块
 
@@ -456,26 +468,14 @@ Chromium 138+ 起，MV3 扩展调用 `chrome.userScripts` 需要用户在扩展�
 - **指标引擎在 30x 杠杆下三参数失效**：`takeProfitRatio` / `reverseExitScore` / `timeStopBars` 全部走不到，因为止损总是先触发。降低杠杆才会让它们生效。
 - **凯利在负期望时仍强制 8% 仓位**：`clamp(f*, 0.08, 0.25)` 的下限会在期望为负时强制开仓，未改。
 
-## 文件
+## 仓库内文件
 
-- `fx-quant.user.js` — 油猴脚本（可直接安装）
-- `test-arch.mts` — 架构约束：模块互不引用、事件契约双向闭合、单一入口
-- `test-contract.mts` — 正确性边界回归（离线 vm 沙箱）：未来隔离、配置恢复、敞口闸、受管仓位、执行核验、异步契约、可卸载
-- `probe-fetch.mts` — 回放模式 frankfurter 请求基线（次数 / 去重 / 窗口复用），用来证明「请求不是瓶颈」
-- `test-tm.mts` — 真实 Edge + Tampermonkey 冒烟（临时 profile + 真实扩展）：安装链路 / 能力检测 / 注入验证
-- `engine-core.mts` — 把脚本装进 vm 沙箱并导出真实决策函数 + 记账式假游戏工具
-- `backtest-unified.mts` — 统一回测：直接调脚本的 `planDrift` / `computeExits` / `exec.commit`，扫参 + 多种子稳健性
-- `test-mobile.mts` — 移动端：默认折叠、视口内、触摸目标、Pointer 拖拽、边界钳制、桌面恢复
-- `test-drift.mts` / `test-drift-math.mts` — 漂移引擎行为与闭式解等价性
-- `test-e2e.mts` / `test-closeall.mts` / `test-automation.mts` — 端到端、全平、自动化与安全边界
-- `test-indicators.mts` — 指标与汇率换算（从源码抽取函数，零重复定义）
-- `probe-*.mts` — 调研用探针（性能 / 移动端 / 漂移 / 事件日历 / 权益曲线 / 一致性对照）
-- `sim/fetch-fx.mts` — 抓 frankfurter 2015-至今全量数据（分段 120 天，`sim/fx-history.json`）
-- `sim/engine.mts` — 引擎离线复刻（与脚本逐行对齐的纯函数，含冷却约束）
-- `sim/scan.mts` — 1170 组三维网格扫参（滚动 15 起点 × 250 天窗口）
-- `sim/validate.mts` — train / valid / game 三段样本外对照
-- `sim/compare.mts` — Node 复刻 vs 浏览器实测逐日对比（定位偏差源用）
-- `panel.png` / `mobile-after.png` — 桌面与移动端实拍
+- `fx-quant.user.js` — FX 简单! 油猴脚本（可直接安装，v2.5.1）
+- `fx-kurumi.user.js` — FX Kurumi 油猴脚本（可直接安装，v0.3.1）
+- `a-share.user.js` — 大A 简单! 油猴脚本（可直接安装，v3.9.1）
+- `README.md` — FX 简单! 的架构、策略、参数和验证说明；顶部另列三个脚本入口。
+
+**仓库完整性说明**：本文早期开发记录提到的 `test-*.mts`、`probe-*.mts`、`sim/*` 和截图等文件，在当前 GitHub `main` 分支的文件树中并未跟踪。它们不能被视为克隆仓库后即可运行的测试资产；若本地开发目录另有这些文件，需以实际目录为准。
 ---
 
 ## 架构调优记录（v2.5.0 之后，纯重构）
@@ -554,3 +554,22 @@ backtest-unified   数字逐位一致
 
 `test-all.mts`（4 context 并行）在新旧版本上都会偶发失败（`replay`/`closeall` 同组、`drift` 敞口），
 属既有并发抖动，与本次重构无关。
+
+
+## 性能维护记录（2026-11）
+
+本轮只做执行路径和临时分配优化，不调整三套脚本的策略阈值、信号权重、仓位比例或开平仓规则：
+
+| 脚本 | 优化点 |
+|---|---|
+| `a-share.user.js` | 稳定复用 tick 查询方法；缓存 API base URL；盘口遍历不再先生成 `Object.keys` 数组 |
+| `fx-kurumi.user.js` | EMA/ATR/趋势/相关性/价差计算直接扫描窗口；移除多组临时数组；风控检查复用本轮计算结果；缓存格式化器并跳过未变化的持仓 DOM 重绘 |
+| `fx-quant.user.js` | 直接以 cursor 索引读取历史前缀；单次扫描计算快慢 EMA；RSI/ATR/布林指标避免复制历史数组；凯利统计单次遍历；缓存模拟盘/采样序列转换，并增强指标缓存失效判断 |
+
+### 等价性检查
+
+- Kurumi 数学函数：86 组随机序列，对照旧算法检查 EMA 尾窗、ATR%、趋势强度、相关性和价差 z-score，全部通过。
+- FX Quant 指标：1,099 组随机价格/K 线序列与不同回放 cursor，对照旧算法检查价格、EMA、MACD、RSI、ATR、布林、ROC 和综合评分，全部通过；最大绝对差为 0。
+- FX Quant 凯利：1,000 组随机交易历史对照旧实现，全部通过。
+
+这些是独立的数值等价测试，不是浏览器端性能 benchmark。当前没有报告真实页面 CPU、长时间堆内存或端到端耗时的改进百分比；仍应在目标浏览器和真实行情/回放 workload 下测量。

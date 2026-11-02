@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大A 简单! · 做市量化台
 // @namespace    fx-quant/a-share
-// @version      3.9.0
+// @version      3.9.1
 // @description  限价做市引擎：bid0+1tick 买入 / ask0-1tick 卖出；纯凯利定仓（无上限）+ 限价止损；主世界直跑，自建 WS 不依赖页面 socket；云存储退避 + 移动端适配 + 遮挡补偿 + WS 退避重连 + token 落盘 + 通知弹窗自动关闭 + 杠杆可调 + 平仓委托接管 + 429 冷却 + requote 限频
 // @match        https://www.bilibili.com/toy/suoha/*
 // @match        https://www.bilibilitoy.com/toy/suoha/*
@@ -100,7 +100,7 @@
     snap: null,
     token: '',
     stocks: new Map(),
-    tickOf: () => TICK_FALLBACK,
+    tickOf(id) { return 10 ** -((conn.stocks.get(id) || {}).digits ?? 2); },
     nameOf: id => (conn.stocks.get(id) || {}).name || id,
   };
 
@@ -261,18 +261,29 @@
   let lastReqAt = 0;       // 上次请求时刻（全局最小间隔）
   function resetRate() { cooldownUntil = 0; lastReqAt = 0; }   // 测试用：清掉限频状态
 
+  let apiBaseRoot = '';
+  let apiBaseUrl = null;
+
+  function apiUrl(path) {
+    const root = PAGE.A_SHARE_BACKEND_URL || BACKEND;
+    if (root !== apiBaseRoot) {
+      apiBaseRoot = root;
+      apiBaseUrl = new URL('api/', root);
+    }
+    return new URL(path, apiBaseUrl);
+  }
+
   async function post(path, body = {}, auth = true) {
     const now = Date.now();
     if (now < cooldownUntil) throw new Error('限频冷却 ' + Math.ceil((cooldownUntil - now) / 1000) + 's');
     const gap = now - lastReqAt;
     if (gap > 0 && gap < MIN_REQ_GAP_MS) await new Promise(r => setTimeout(r, MIN_REQ_GAP_MS - gap));
     lastReqAt = Date.now();
-    const base = new URL('api/', PAGE.A_SHARE_BACKEND_URL || BACKEND);
     const headers = { 'Content-Type': 'application/json', 'X-A-Share-Action': '1' };
     if (auth && conn.token) headers.Authorization = 'Bearer ' + conn.token;
     const signals = [AbortSignal.timeout(REQ_TIMEOUT_MS)];
     if (inflight) signals.push(inflight.signal);
-    const r = await fetch(new URL(path, base), {
+    const r = await fetch(apiUrl(path), {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -289,11 +300,8 @@
 
   /* ================= 快照入库 ================= */
   function indexStocks(snap) {
-    let changed = false;
-    for (const s of snap.stocks || []) {
-      if (conn.stocks.get(s.id) !== s) { conn.stocks.set(s.id, s); changed = true; }
-    }
-    if (changed) conn.tickOf = id => 10 ** -((conn.stocks.get(id) || {}).digits ?? 2);
+    // tickOf 是稳定闭包，直接读取最新 Map；每帧快照无需重新创建函数对象。
+    for (const stock of snap.stocks || []) conn.stocks.set(stock.id, stock);
   }
 
   function detectFill(snap) {
@@ -335,7 +343,10 @@
 
   function pickPair(snap) {
     let best = null;
-    for (const p of Object.keys(snap.orderBooks || {})) {
+    const books = snap.orderBooks;
+    if (!books) return null;
+    for (const p in books) {
+      if (!Object.prototype.hasOwnProperty.call(books, p)) continue;
       const bk = snap.orderBooks[p];
       const bid = bk && bk.bids && bk.bids[0];
       const ask = bk && bk.asks && bk.asks[0];

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FX Kurumi Quant
 // @namespace    fxkq
-// @version      0.3.0
+// @version      0.3.1
 // @description  久留美模拟器：风控执行 / 指标过滤 / 配对套利
 // @author       local
 // @match        https://www.bilibilitoy.com/toy/fx-kurumi/*
@@ -10,7 +10,7 @@
 // ==/UserScript==
 (() => {
     'use strict';
-    const VERSION = '0.3.0';
+    const VERSION = '0.3.1';
     /* ───────── 事件契约（冻结） ───────── */
     const EV = Object.freeze({
         BRIDGE_READY: 'bridge:ready',
@@ -177,12 +177,13 @@
         }
         return Math.sqrt(s / (v.length - 1));
     }
-    function ema(v, n) {
+    function ema(v, n, start = 0) {
         if (!v.length || n <= 0)
             return 0;
+        const first = Math.max(0, Math.min(v.length - 1, start));
         const k = 2 / (n + 1);
-        let e = v[0];
-        for (let i = 1; i < v.length; i++)
+        let e = v[first];
+        for (let i = first + 1; i < v.length; i++)
             e = v[i] * k + e * (1 - k);
         return e;
     }
@@ -203,33 +204,43 @@
     }
     /** 无 OHLC 时的 ATR 代理：|Δp|/p 的 EMA */
     function atrPct(v, n) {
-        if (v.length < 2)
+        if (v.length < 2 || n <= 0)
             return 0;
-        const d = [];
-        for (let i = 1; i < v.length; i++)
-            d.push(Math.abs(v[i] - v[i - 1]) / Math.max(v[i - 1], 1e-12));
-        return ema(d.slice(-Math.max(n, 2)), n);
+        // 只计算 EMA 实际使用的尾部差分，避免构造完整 d 数组再 slice。
+        const first = Math.max(1, v.length - Math.max(n, 2));
+        const k = 2 / (n + 1);
+        let e = Math.abs(v[first] - v[first - 1]) / Math.max(v[first - 1], 1e-12);
+        for (let i = first + 1; i < v.length; i++) {
+            const d = Math.abs(v[i] - v[i - 1]) / Math.max(v[i - 1], 1e-12);
+            e = d * k + e * (1 - k);
+        }
+        return e;
     }
     /** ADX 代理：|净位移| / 总行程，0=纯震荡 1=单边 */
     function trendiness(v, n) {
         if (v.length < n + 1)
             return 0;
-        const seg = v.slice(-(n + 1));
+        const first = v.length - n - 1;
         let path = 0;
-        for (let i = 1; i < seg.length; i++)
-            path += Math.abs(seg[i] - seg[i - 1]);
-        const net = Math.abs(seg[seg.length - 1] - seg[0]);
+        for (let i = first + 1; i < v.length; i++)
+            path += Math.abs(v[i] - v[i - 1]);
+        const net = Math.abs(v[v.length - 1] - v[first]);
         return path > 0 ? net / path : 0;
     }
     function correlation(a, b) {
         const n = Math.min(a.length, b.length);
         if (n < 3)
             return 0;
-        const x = a.slice(-n), y = b.slice(-n);
-        const mx = mean(x), my = mean(y);
+        const a0 = a.length - n, b0 = b.length - n;
+        let sx = 0, sy = 0;
+        for (let i = 0; i < n; i++) {
+            sx += a[a0 + i];
+            sy += b[b0 + i];
+        }
+        const mx = sx / n, my = sy / n;
         let sxy = 0, sxx = 0, syy = 0;
         for (let i = 0; i < n; i++) {
-            const dx = x[i] - mx, dy = y[i] - my;
+            const dx = a[a0 + i] - mx, dy = b[b0 + i] - my;
             sxy += dx * dy;
             sxx += dx * dx;
             syy += dy * dy;
@@ -243,27 +254,43 @@
         const len = Math.min(a.length, b.length, n);
         if (len < MIN_SPREAD_LEN)
             return { beta: 0, z: 0, sd: 0 };
-        const x = [], y = [];
-        for (let i = a.length - len; i < a.length; i++)
-            y.push(Math.log(Math.max(a[i], 1e-12)));
-        for (let i = b.length - len; i < b.length; i++)
-            x.push(Math.log(Math.max(b[i], 1e-12)));
-        const mx = mean(x), my = mean(y);
+        const a0 = a.length - len, b0 = b.length - len;
+        let sx = 0, sy = 0;
+        for (let i = 0; i < len; i++) {
+            sx += Math.log(Math.max(b[b0 + i], 1e-12));
+            sy += Math.log(Math.max(a[a0 + i], 1e-12));
+        }
+        const mx = sx / len, my = sy / len;
         let sxy = 0, sxx = 0;
         for (let i = 0; i < len; i++) {
-            const dx = x[i] - mx;
-            sxy += dx * (y[i] - my);
+            const dx = Math.log(Math.max(b[b0 + i], 1e-12)) - mx;
+            const dy = Math.log(Math.max(a[a0 + i], 1e-12)) - my;
+            sxy += dx * dy;
             sxx += dx * dx;
         }
         const beta = sxx > 1e-12 ? sxy / sxx : 0;
         const alpha = my - beta * mx;
-        const spread = [];
-        for (let i = 0; i < len; i++)
-            spread.push(y[i] - (alpha + beta * x[i]));
-        const sd = stdev(spread);
+        // stdev(spread) 使用样本标准差；两次累计避免分配 x/y/spread 三个数组。
+        let spreadMean = 0;
+        for (let i = 0; i < len; i++) {
+            const x = Math.log(Math.max(b[b0 + i], 1e-12));
+            const y = Math.log(Math.max(a[a0 + i], 1e-12));
+            spreadMean += y - (alpha + beta * x);
+        }
+        spreadMean /= len;
+        let sumSq = 0, lastSpread = 0;
+        for (let i = 0; i < len; i++) {
+            const x = Math.log(Math.max(b[b0 + i], 1e-12));
+            const y = Math.log(Math.max(a[a0 + i], 1e-12));
+            const residual = y - (alpha + beta * x);
+            const d = residual - spreadMean;
+            sumSq += d * d;
+            if (i === len - 1) lastSpread = residual;
+        }
+        const sd = Math.sqrt(sumSq / (len - 1));
         if (sd < 1e-12)
             return { beta, z: 0, sd: 0 };
-        return { beta, z: spread[spread.length - 1] / sd, sd };
+        return { beta, z: (lastSpread - spreadMean) / sd, sd };
     }
     /* MATH:END */
     /* ───────── fiber 原语（纯函数，无闭包状态） ───────── */
@@ -614,8 +641,12 @@
             if (r.daysToRent <= c.rentBufferDays && r.rentShortJpy > 0)
                 next.add('RENT');
             tripped = next;
-            dirty = true;
-            bus.emit(EV.RISK, report());
+            // 本轮 compute() 已拿到完整新快照，只更新触发列表并复用结果，
+            // 避免 report() 再遍历全部持仓并重复换算货币。
+            r.tripped = Array.from(next);
+            cache = r;
+            dirty = false;
+            bus.emit(EV.RISK, cache);
         }
         function report() {
             if (cache && !dirty)
@@ -702,7 +733,8 @@
             if (trend < TUNING.signalMinTrend)
                 continue;
             const r = rsi(px, TUNING.signalRsiN);
-            const up = ema(px.slice(-40), TUNING.signalFastN) > ema(px.slice(-120), TUNING.signalSlowN);
+            const up = ema(px, TUNING.signalFastN, Math.max(0, px.length - 40))
+                > ema(px, TUNING.signalSlowN, Math.max(0, px.length - 120));
             if (up && r > TUNING.signalRsiHigh)
                 continue;
             if (!up && r < TUNING.signalRsiLow)
@@ -877,7 +909,9 @@
         let root = null;
         let raf = 0;
         const el = {};
-        const money = (n) => n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+        let positionsMarkup = null;
+        const MONEY_FMT = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
+        const money = n => MONEY_FMT.format(n);
         function requestRender() {
             if (raf)
                 return;
@@ -968,13 +1002,17 @@
             el.pairsBtn.className = 'btn' + (c.pairs ? ' on' : '');
             if (!el.body.classList.contains('open'))
                 return;
-            el.positions.innerHTML = r.rows.map((row) => {
+            const nextPositionsMarkup = r.rows.map((row) => {
                 const pct = Math.max(0, Math.min(1, 1 - row.liqDist / GAME.LIQ_RATIO));
                 const cls = row.liqDist < 0.2 ? 'bad' : row.liqDist < 0.4 ? 'warn' : '';
                 return '<div class="pos"><div class="t"><span>' + row.symbol + ' ' + (row.side === 'long' ? '多' : '空') + '</span><span class="' + cls + '">' + (row.pnl >= 0 ? '+' : '') + row.pnl.toFixed(2) + '</span></div>' +
                     '<div class="t"><span class="k">爆仓距 ' + row.liqDist.toFixed(2) + '</span><span class="k">' + row.price + '</span></div>' +
                     '<div class="bar"><i style="width:' + (pct * 100).toFixed(0) + '%"></i></div></div>';
             }).join('') || '<div class="k" style="padding:2px 0">无持仓</div>';
+            if (nextPositionsMarkup !== positionsMarkup) {
+                el.positions.innerHTML = nextPositionsMarkup;
+                positionsMarkup = nextPositionsMarkup;
+            }
             el.log.textContent = log.tail(TUNING.logPanelLines).join('\n');
         }
         return {
