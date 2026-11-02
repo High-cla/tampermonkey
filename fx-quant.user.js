@@ -929,11 +929,14 @@
       if (!n) return null;
       const last = series.prices[n - 1];
       const cursor = series.cursor ?? -1;
+      const pricesRef = series.prices, candlesRef = series.candles;
       const key = mode + '|' + pair;
       const hit = state.indCache.get(key);
-      if (hit && hit.n === n && hit.last === last && hit.cursor === cursor) return hit.ind;
+      // 引用变化也会失效缓存：防止相同长度/末价但历史前缀已替换时读到旧评分。
+      if (hit && hit.n === n && hit.last === last && hit.cursor === cursor
+        && hit.pricesRef === pricesRef && hit.candlesRef === candlesRef) return hit.ind;
       const ind = computeIndicators(series, pair);
-      state.indCache.set(key, { n, last, cursor, ind });
+      state.indCache.set(key, { n, last, cursor, pricesRef, candlesRef, ind });
       return ind;
     }
 
