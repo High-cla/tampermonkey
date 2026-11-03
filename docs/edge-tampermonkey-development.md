@@ -73,6 +73,10 @@
 可复用的官方平台资料：
 
 - [Bilibili Toy 平台介绍](https://www.bilibili.com/toy/intro)：说明 Toy 是可直接在网页中打开的互动内容平台。
+- [Toy 发布指南](https://www.bilibili.com/toy/publish/guide)：官方发布入口与发布流程。
+- [Toy SDK TypeScript 声明](https://www.bilibili.com/toy/publish/sdk)：官方 SDK 类型声明入口；建议作为平台 SDK 能力、参数和返回类型的首要核对源。该页面当前不一定能被通用网页抓取器解析，实际开发时应直接在浏览器中打开并核对声明。
+- [Toy 开发者小站](https://www.bilibili.com/bubble/home/86)：官方开发者交流与 FAQ 发布入口；目前检索到的 FAQ 更新至 2026-10-23。
+- [Toy 开发者 FAQ](https://www.bilibili.com/opus/1241171666570051585)：开发者常见问题入口；B站页面可能触发验证码，具体规则应以页面可见的官方内容为准。
 - [bilibili/toy GitHub 仓库](https://github.com/bilibili/toy)：这是 Toy Creator CLI、Agent Skill 和 DSH 插件项目，不是本仓库三个小游戏的前端源码，也不是其内部交易 API 的完整规范。
 - [Toy Skill 内容检查清单](https://github.com/bilibili/toy/blob/main/skills/toy/references/content-checklist.md)：可参考平台云存储/共享配额的注意事项；不能据此推导本仓库游戏内交易 API 的签名。
 
@@ -102,7 +106,7 @@
 
 ### 大A（a-share.user.js）
 
-当前已直接使用页面 fetch 调后端 API，并通过 WebSocket 获取快照；对 429 实施冷却和最小请求间隔。会话令牌从页面 WebSocket / Toy 云存储 / 本地缓存衔接。交易路径已经 API 优先，不建议为了统一写法而换成 GM 请求。
+当前已直接使用页面 fetch 调后端 API，并通过 WebSocket 获取快照；对 429 实施冷却和最小请求间隔。会话令牌从页面 WebSocket / Toy 云存储 / 本地缓存衔接。交易路径已经 API 优先，不建议为了统一写法而换成 GM 请求。Toy 平台的 cloud storage / leaderboard 能力应按上面的官方 SDK 声明确认方法签名；本脚本使用的云存储会话 token 与游戏业务后端交易 API 不是同一类接口。
 
 ## 5. API 优先的实施原则
 
@@ -142,7 +146,7 @@
 
 ### 本次落地的微优化
 
-Kurumi 的行情采集每秒调用 harvestQuoteMap → walkFibers。原 walkFibers 每次创建一个 Set，并对遍历到的 Fiber 节点分别调用 has/add 进行去重；遍历边只有 child 和 sibling，是树遍历，不沿 return 或 alternate 回走。已移除每次扫描的 Set 与逐节点 has/add，保留原有 DFS 入栈顺序、提前终止行为和 maxFibers 上限。该改动不触碰信号、仓位、交易阈值。
+Kurumi 的行情采集每秒调用 harvestQuoteMap → walkFibers。原 walkFibers 每次创建一个 Set，并对遍历到的 Fiber 节点分别调用 has/add 进行去重；遍历边只有 child 和 sibling，是树遍历，不沿 return 或 alternate 回走。已移除每次扫描的 Set 与逐节点 has/add，保留原有 DFS 入栈顺序、提前终止行为和 maxFibers 上限。行情 feed 回调原先每秒用 Object.entries(bridge.quotes)，会创建 entries 数组及每个键值对数组；改为 for...in + hasOwnProperty，保留只读可枚举自有字符串键的语义。两项改动都不触碰信号、仓位、交易阈值。
 
 **尚未声称具体性能百分比：** 此次提交没有在实际 Edge 目标页面运行性能录制。需要使用同一游戏模式、同一行情负载录制前后 CPU 主线程和堆内存，并确认行情扫描结果一致后，才能报告改进幅度。
 
