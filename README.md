@@ -10,10 +10,12 @@ B站小游戏「FX 简单!」(<https://www.bilibili.com/toy/fx-simple/index.html
 | 脚本 | 当前版本 | 页面 / 主要职责 |
 |---|---:|---|
 | `fx-quant.user.js` | 2.5.1 | FX 简单!：漂移、回放前瞻、技术指标、敞口风控与移动面板 |
-| `fx-kurumi.user.js` | 0.3.1 | FX Kurumi：行情采集、配对回归、方向性信号与账户/租金风控 |
+| `fx-kurumi.user.js` | 0.3.3 | FX Kurumi：行情采集、配对回归、方向性信号与账户/租金风控 |
 | `a-share.user.js` | 3.9.1 | 大A 简单!：限价做市、订单状态机、撤单/止损与行情 WebSocket |
 
 本 README 后续的架构、指标、回测和参数说明主要针对 **FX 简单!（`fx-quant.user.js`）**，不是另外两个脚本的策略规格。三个脚本的交易阈值和策略参数彼此独立。
+
+开发与性能维护参考：[Edge + Tampermonkey 开发指南](docs/edge-tampermonkey-development.md)。
 
 ## 架构：一个总线 + 八个互不引用的模块
 
@@ -471,7 +473,7 @@ Chromium 138+ 起，MV3 扩展调用 `chrome.userScripts` 需要用户在扩展�
 ## 仓库内文件
 
 - `fx-quant.user.js` — FX 简单! 油猴脚本（可直接安装，v2.5.1）
-- `fx-kurumi.user.js` — FX Kurumi 油猴脚本（可直接安装，v0.3.1）
+- `fx-kurumi.user.js` — FX Kurumi 油猴脚本（可直接安装，v0.3.3）
 - `a-share.user.js` — 大A 简单! 油猴脚本（可直接安装，v3.9.1）
 - `README.md` — FX 简单! 的架构、策略、参数和验证说明；顶部另列三个脚本入口。
 
@@ -563,7 +565,7 @@ backtest-unified   数字逐位一致
 | 脚本 | 优化点 |
 |---|---|
 | `a-share.user.js` | 稳定复用 tick 查询方法；缓存 API base URL；盘口遍历不再先生成 `Object.keys` 数组 |
-| `fx-kurumi.user.js` | EMA/ATR/趋势/相关性/价差计算直接扫描窗口；移除多组临时数组；风控检查复用本轮计算结果；缓存格式化器并跳过未变化的持仓 DOM 重绘 |
+| `fx-kurumi.user.js` | EMA/ATR/趋势/相关性/价差计算直接扫描窗口；移除多组临时数组；风控检查复用本轮计算结果；缓存格式化器并跳过未变化的持仓 DOM 重绘；Fiber 树遍历去除冗余 Set、行情回调用 for...in 替代 Object.entries 降低临时分配（v0.3.3） |
 | `fx-quant.user.js` | 直接以 cursor 索引读取历史前缀；单次扫描计算快慢 EMA；RSI/ATR/布林指标避免复制历史数组；凯利统计单次遍历；缓存模拟盘/采样序列转换，并增强指标缓存失效判断 |
 
 ### 等价性检查
