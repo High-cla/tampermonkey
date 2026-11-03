@@ -51,6 +51,6 @@ test('Ring Buffer clear resets indexes and releases retained entries', () => {
 
 test('Ring Buffer rejects invalid capacities', () => {
   for (const value of [0, -1, 1.5, NaN, Infinity]) {
-    assert.throws(() => createRingBuffer(value), RangeError);
+    assert.throws(() => createRingBuffer(value), { name: 'RangeError' });
   }
 });
