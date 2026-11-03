@@ -107,6 +107,14 @@
 
 需要关注的下一步：当前 bridge.call() 是同步接口；若页面工具的 execute() 返回 Promise，代码会明确报告失败，而不会把 Promise 当成数据。不要简单删除这个保护。若需支持异步工具，应将“采集 → 计算 → 执行”改造成可取消的异步命令流，并为每轮快照设置序号，丢弃过期结果；保留 DOM fallback 和下单后的回读核验。
 
+#### WebMCP 原生接口的兼容性
+
+- [WebMCP 规范仓库](https://github.com/webmachinelearning/webmcp) 与 [Chrome WebMCP 开发指南](https://developer.chrome.com/docs/modern-web-guidance/guides/webmcp/agentic-javascript-tools) 都以 `document.modelContext` 为工具注册入口。
+- 规范中的 `registerTool()`、`getTools()`、`executeTool()` 都是 Promise API；工具 `execute` 也允许异步执行，并可接收执行期 `AbortSignal`。参见 [WebMCP 接口定义](https://github.com/webmachinelearning/webmcp/blob/main/index.bs)。
+- [WebMCP 浏览器实现状态](https://github.com/webmachinelearning/webmcp/blob/main/implementation-status.md) 当前列出 Chrome 149 的 Origin Trial，以及 Edge 150 的 Origin Trial。对 Edge 149 不应假定原生 WebMCP 已可用，必须先做功能检测。
+- 当前 FX Quant 通过拦截 `registerTool` 捕获页面工具，并直接调用 `tool.execute(args)`；这属于当前兼容桥的实现方式，不等同于通过标准 `document.modelContext.executeTool()` 发起浏览器介导的调用。当前代码对 thenable 返回失败是有意的 fail-closed 保护。
+- 下一步不应简单把 `tool.execute` 改成 `await`：需要同时把 `data.collect/snapshot`、`exec.openTrade/closeTrade/advanceDay/verifyPosition` 和事件调度改为异步串行流程，加入快照代次号、取消信号、重复动作闸门与交易后回读。应继续保留旧 Toy 工具适配器和 DOM 降级，直到 Edge / Toy 运行时明确支持标准接口。
+
 ### FX Kurumi（fx-kurumi.user.js）
 
 当前通过 React Fiber 的内部字段查找订阅函数和行情对象。这种方式依赖 React 内部实现和游戏打包结构，**不是稳定公开 API**。推荐升级顺序：
