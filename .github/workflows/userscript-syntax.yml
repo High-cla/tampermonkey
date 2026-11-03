@@ -32,5 +32,6 @@ jobs:
           node --check a-share.user.js
           node --check fx-kurumi.user.js
           node --check fx-quant.user.js
+          node --check tools/toy-performance-monitor.user.js
       - name: Run performance primitive regression tests
         run: node --test tests/*.test.mjs
