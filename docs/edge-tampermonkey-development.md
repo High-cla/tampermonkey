@@ -180,3 +180,17 @@ Kurumi 的行情采集每秒调用 harvestQuoteMap → walkFibers。原 walkFibe
 6. 在桌面 Edge、页面后台/恢复、网络断开重连、登录态过期和移动 Chromium 环境中检查生命周期与降级路径。
 
 仓库当前主分支可见的 CI 工作流只运行三个脚本的 node --check 语法检查；README 记载的部分回测/等价性测试源文件并未出现在当前主分支文件树中。因此，静态语法 CI 不能替代浏览器性能或策略回归验证。
+
+
+## Additional optimization backlog (2026-11)
+
+- Fixed-capacity ring buffers for tick windows and time buckets, avoiding repeated `shift()` and array movement.
+- Fused tail-window scans for related directional indicators when equivalence tests preserve the existing formulas.
+- In-flight request deduplication in addition to resolved-response caching.
+- Reuse `Map`/`Set` lookup structures in hot strategy paths.
+- Keep `requestAnimationFrame` batching and DOM diffing for panel rendering.
+- Use `AbortController` for cancelable reads and disposal; do not assume a tool-side financial action was cancelled merely because the caller stopped awaiting it.
+- Prefer `MutationObserver` with a low-frequency fallback over aggressive polling.
+- Use `TypedArray` and Worker only after profiling shows a sufficiently large numeric workload; transfer/copy and startup costs can exceed the saved compute time for small workloads.
+
+Browser measurements remain a separate acceptance gate from syntax and unit tests. Record CPU time, long tasks, heap size, quote throughput, network request count, and action latency under the same Edge build and scenario.
