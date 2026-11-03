@@ -142,7 +142,7 @@
 
 ### 本次落地的微优化
 
-Kurumi 的行情采集每秒调用 harvestQuoteMap → walkFibers。原 walkFibers 每次创建一个 Set，并对遍历到的 Fiber 节点做重复成员判断；遍历边只有 child 和 sibling，是树遍历，不沿 return 或 alternate 回走。已移除每次扫描的 Set，保留原有 DFS 入栈顺序、提前终止行为和 maxFibers 上限。该改动不触碰信号、仓位、交易阈值。
+Kurumi 的行情采集每秒调用 harvestQuoteMap → walkFibers。原 walkFibers 每次创建一个 Set，并对遍历到的 Fiber 节点分别调用 has/add 进行去重；遍历边只有 child 和 sibling，是树遍历，不沿 return 或 alternate 回走。已移除每次扫描的 Set 与逐节点 has/add，保留原有 DFS 入栈顺序、提前终止行为和 maxFibers 上限。该改动不触碰信号、仓位、交易阈值。
 
 **尚未声称具体性能百分比：** 此次提交没有在实际 Edge 目标页面运行性能录制。需要使用同一游戏模式、同一行情负载录制前后 CPU 主线程和堆内存，并确认行情扫描结果一致后，才能报告改进幅度。
 
