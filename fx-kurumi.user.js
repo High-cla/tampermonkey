@@ -312,7 +312,7 @@
         if (!root)
             return;
         // child/sibling 是 Fiber 树的遍历边；不沿 return/alternate 走，正常树中节点只入栈一次。
-        // harvest() 每秒执行；移除每轮新建的 Set 及 O(n) membership 检查，maxFibers 仍限制异常树。
+        // harvest() 每秒执行；移除每轮新建的 Set 及每个节点上的 has/add 操作，maxFibers 仍限制异常树。
         const stack = [root];
         let n = 0;
         while (stack.length && n < TUNING.maxFibers) {
