@@ -7,6 +7,9 @@ on:
       - "fx-kurumi.user.js"
       - "fx-quant.user.js"
       - ".github/workflows/userscript-syntax.yml"
+      - "tests/**"
+      - "tools/**"
+      - "docs/performance-benchmark.md"
   workflow_dispatch:
 
 permissions:
@@ -29,3 +32,5 @@ jobs:
           node --check a-share.user.js
           node --check fx-kurumi.user.js
           node --check fx-quant.user.js
+      - name: Run performance primitive regression tests
+        run: node --test tests/*.test.mjs
