@@ -56,6 +56,16 @@ WebSocket 探测在 DevTools 的 Network → WS 中先做：确认 socket URL、
 
 若没有页面公开的 store 或 WebSocket 契约，Fiber 保持为兼容实现，并把“未发现公开 API”作为结果记录，而不是臆造 API 名称。
 
+仓库内的只读探测脚本：tools/kurumi-public-api-probe.user.js。安装后在游戏页 Console 执行：
+
+\`\`\`js
+__FXKQ_API_PROBE__.inspect();              // 只枚举页面主动暴露的数据属性与方法类型
+__FXKQ_API_PROBE__.read('gameStore');       // 仅对选定候选调用 getState/getSnapshot 并返回结构摘要
+\`\`\`
+
+该探测器不会调用 subscribe、不会改写 WebSocket、不会读取 React Fiber，也不会输出账户/持仓的具体数值。若没有命中候选，代表“这些约定名称未暴露”，并不能证明应用内部不存在私有 store。
+
+
 ## 统一基准测试
 
 仓库增加了一个可独立安装的低侵入监测脚本：
@@ -111,3 +121,8 @@ node --test tests/*.test.mjs
 - Edge DevTools Performance：https://learn.microsoft.com/en-us/microsoft-edge/devtools/performance/
 
 截至本次记录，WebMCP 在 Edge 的实现状态仍属于 Origin Trial 级别；不要假设任意 Edge Stable 环境都能调用 document.modelContext。
+
+
+## 本分支实现状态说明
+
+当前分支已加入 Ring Buffer 原语、其 FIFO/回绕/清空边界测试和微基准，并提供页面级监测器与 Kurumi 公共 store 只读探测器。Ring Buffer 原语尚未接入 Kurumi 的行情序列热路径；在生产序列替换、异步订单链迁移和等价回归完成前，不计为已经获得的运行时性能收益。
