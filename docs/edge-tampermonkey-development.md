@@ -66,9 +66,9 @@
 
 | 项目 | 页面入口 / URL 匹配范围 | 当前代码路径 |
 |---|---|---|
-| FX 简单! | [Toy FX Simple](https://www.bilibili.com/toy/fx-simple/index.html)；脚本匹配 https://www.bilibilitoy.com/toy/fx-simple/* | 页面工具 API + 本地存档 + DOM 降级；历史行情由 Frankfurter API 获取 |
-| FX Kurumi | https://www.bilibilitoy.com/toy/fx-kurumi/* | 订阅 React Fiber 中发现的 store，并采集行情快照 |
-| 大A 简单! | https://www.bilibili.com/toy/suoha/* 与 https://www.bilibilitoy.com/toy/suoha/* | 后端 HTTP API + WebSocket；页面 socket / 云存储用于会话信息衔接 |
+| FX 简单! | [公开入口](https://www.bilibili.com/toy/fx-simple/index.html)；当前解析到的游戏资源页为 [fx-simple/37279699568640-v24785](https://www.bilibilitoy.com/toy/fx-simple/37279699568640-v24785/index.html)；脚本匹配 https://www.bilibilitoy.com/toy/fx-simple/* | 页面工具 API + 本地存档 + DOM 降级；历史行情由 Frankfurter API 获取 |
+| FX Kurumi | 脚本配置路径：https://www.bilibilitoy.com/toy/fx-kurumi/* | 订阅 React Fiber 中发现的 store，并采集行情快照；当前未独立验证公开页面 URL |
+| 大A 简单! | 脚本配置路径：https://www.bilibili.com/toy/suoha/* 与 https://www.bilibilitoy.com/toy/suoha/* | 后端 HTTP API + WebSocket；页面 socket / 云存储用于会话信息衔接；当前未独立验证公开页面 URL |
 
 可复用的官方平台资料：
 
@@ -79,6 +79,8 @@
 - [Toy 开发者 FAQ](https://www.bilibili.com/opus/1241171666570051585)：开发者常见问题入口；B站页面可能触发验证码，具体规则应以页面可见的官方内容为准。
 - [bilibili/toy GitHub 仓库](https://github.com/bilibili/toy)：这是 Toy Creator CLI、Agent Skill 和 DSH 插件项目，不是本仓库三个小游戏的前端源码，也不是其内部交易 API 的完整规范。
 - [Toy Skill 内容检查清单](https://github.com/bilibili/toy/blob/main/skills/toy/references/content-checklist.md)：可参考平台云存储/共享配额的注意事项；不能据此推导本仓库游戏内交易 API 的签名。
+
+**FX 页面说明：** 当前可公开访问的 FX 简单! 页面说明它是模拟账户游戏，真实数据为历史日度参考汇率，并明确声明不是实时交易报价。Bilibili 外层入口会解析到带资源版本号的 bilibilitoy.com 子路径；userscript 的路径通配符能够覆盖该版本化子路径。
 
 **API 文档缺口：** 目前未找到这三个小游戏内部交易接口的独立公开 API 参考。下面列出的 read_fx_game_state、place_fx_trade、游戏 store / WebSocket 等是从本仓库当前代码识别出的集成点，不应误称为公开、稳定的官方接口。游戏页面的动态资源也无法仅凭公开静态文档完整验证；升级前需要在实际 Edge 页面重新检查。
 
@@ -144,7 +146,7 @@
 - 为少量数据手写复杂对象池。
 - 在没有基准测试的情况下，将 map 改成 for 并声称更快。
 
-### 本次落地的微优化
+### 本次落地的微优化（FX Kurumi 0.3.3）
 
 Kurumi 的行情采集每秒调用 harvestQuoteMap → walkFibers。原 walkFibers 每次创建一个 Set，并对遍历到的 Fiber 节点分别调用 has/add 进行去重；遍历边只有 child 和 sibling，是树遍历，不沿 return 或 alternate 回走。已移除每次扫描的 Set 与逐节点 has/add，保留原有 DFS 入栈顺序、提前终止行为和 maxFibers 上限。行情 feed 回调原先每秒用 Object.entries(bridge.quotes)，会创建 entries 数组及每个键值对数组；改为 for...in + hasOwnProperty，保留只读可枚举自有字符串键的语义。两项改动都不触碰信号、仓位、交易阈值。
 
