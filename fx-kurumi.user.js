@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FX Kurumi Quant
 // @namespace    fxkq
-// @version      0.3.1
+// @version      0.3.2
 // @description  久留美模拟器：风控执行 / 指标过滤 / 配对套利
 // @author       local
 // @match        https://www.bilibilitoy.com/toy/fx-kurumi/*
@@ -10,7 +10,7 @@
 // ==/UserScript==
 (() => {
     'use strict';
-    const VERSION = '0.3.1';
+    const VERSION = '0.3.2';
     /* ───────── 事件契约（冻结） ───────── */
     const EV = Object.freeze({
         BRIDGE_READY: 'bridge:ready',
@@ -311,15 +311,15 @@
     function walkFibers(root, visit) {
         if (!root)
             return;
-        const seen = new Set();
+        // child/sibling 是 Fiber 树的遍历边；不沿 return/alternate 走，正常树中节点只入栈一次。
+        // harvest() 每秒执行；移除每轮新建的 Set 及 O(n) membership 检查，maxFibers 仍限制异常树。
         const stack = [root];
         let n = 0;
         while (stack.length && n < TUNING.maxFibers) {
             const f = stack.pop();
             n++;
-            if (!f || seen.has(f))
+            if (!f)
                 continue;
-            seen.add(f);
             if (visit(f))
                 return;
             if (f.child)
