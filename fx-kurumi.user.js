@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FX Kurumi Quant
 // @namespace    fxkq
-// @version      0.3.2
+// @version      0.3.3
 // @description  久留美模拟器：风控执行 / 指标过滤 / 配对套利
 // @author       local
 // @match        https://www.bilibilitoy.com/toy/fx-kurumi/*
@@ -10,7 +10,7 @@
 // ==/UserScript==
 (() => {
     'use strict';
-    const VERSION = '0.3.2';
+    const VERSION = '0.3.3';
     /* ───────── 事件契约（冻结） ───────── */
     const EV = Object.freeze({
         BRIDGE_READY: 'bridge:ready',
@@ -555,7 +555,12 @@
         function onQuotes() {
             const now = Date.now();
             const next = {};
-            for (const [sym, q] of Object.entries(bridge.quotes)) {
+            const source = bridge.quotes;
+            // 与 Object.entries 等价：只处理可枚举自有字符串键，但不创建 entries 与键值对临时数组。
+            for (const sym in source) {
+                if (!Object.prototype.hasOwnProperty.call(source, sym))
+                    continue;
+                const q = source[sym];
                 if (!q || q.stale || !Number.isFinite(q.mid) || q.mid <= 0)
                     continue;
                 next[sym] = q.mid;
