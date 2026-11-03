@@ -44,6 +44,16 @@
 | 跨域请求 | [GM.xmlHttpRequest](https://www.tampermonkey.net/documentation.php?q=GM_xmlhttpRequest) | 仅在页面 fetch 因 CORS 不可用时考虑 |
 | 存储 | [GM_getValue / GM_setValue](https://www.tampermonkey.net/documentation.php?q=GM_values) | 需要脚本隔离存储或跨页面持久化时使用 |
 
+### Edge 上安装后必须核对的注入权限
+
+- Tampermonkey 官方 FAQ：[Q209：执行用户脚本的权限](https://www.tampermonkey.net/faq.php?locale=zh&q=Q209)。
+- Chromium Edge 138+：打开 `edge://extensions` → Tampermonkey →「详细信息」→ 开启「允许用户脚本（Allow User Scripts）」。
+- Chromium Edge 137 及更早版本：按 Tampermonkey FAQ 指引开启扩展「开发人员模式」。
+- Tampermonkey 5.3+ 在基于 Chromium 的浏览器上需要该用户脚本执行授权；只打开 Dashboard 中的脚本启用开关不够。
+- 截至 2026-11-03，官方更新日志当前可见最新版本记录为 **5.6.6243（2026-10-08）**：[Tampermonkey Changes](https://www.tampermonkey.net/changelog.php)。建议优先使用稳定版，并在更新后重新确认注入权限。
+
+当前用户环境是 Edge 149 系列，因此应检查「允许用户脚本」开关，而不是只检查开发人员模式。
+
 关键差异：
 
 - @grant none 表示不使用 GM API，并影响脚本沙盒行为；不能在保留它的同时假设 GM.xmlHttpRequest 可用。
