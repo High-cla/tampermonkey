@@ -493,24 +493,27 @@
     function createSeries() {
         const ticks = new Map();
         const buckets = new Map();
+
         function push(symbol, price, now) {
             if (!symbol || !Number.isFinite(price) || price <= 0)
                 return;
+
             let arr = ticks.get(symbol);
             if (!arr) {
-                arr = [];
+                arr = createRingBuffer(TUNING.maxTicks);
                 ticks.set(symbol, arr);
             }
-            const last = arr[arr.length - 1];
+
+            const last = arr.at(-1);
             if (last && now - last.t < TUNING.tickDedupeMs) {
                 last.p = price;
                 last.t = now;
             }
             else {
+                // 固定容量 FIFO：满时覆盖最旧 tick，不再调用 Array.shift()
                 arr.push({ t: now, p: price });
-                if (arr.length > TUNING.maxTicks)
-                    arr.shift();
             }
+
             let bm = buckets.get(symbol);
             if (!bm) {
                 bm = new Map();
@@ -520,25 +523,31 @@
             if (bm.size > TUNING.maxBuckets)
                 bm.delete(bm.keys().next().value);
         }
+
         function prices(symbol) {
             const arr = ticks.get(symbol);
             if (!arr)
                 return [];
+
             const out = new Array(arr.length);
             for (let i = 0; i < arr.length; i++)
-                out[i] = arr[i].p;
+                out[i] = arr.at(i).p;
             return out;
         }
+
         /** 两标的分桶对齐（同 bucket 索引） */
         function aligned(a, b) {
             const ba = buckets.get(a), bb = buckets.get(b);
             if (!ba || !bb)
                 return { a: [], b: [], n: 0 };
+
             const keys = [];
             for (const k of ba.keys())
                 if (bb.has(k))
                     keys.push(k);
+
             keys.sort((x, y) => x - y);
+
             const outA = new Array(keys.length);
             const outB = new Array(keys.length);
             for (let i = 0; i < keys.length; i++) {
@@ -547,6 +556,7 @@
             }
             return { a: outA, b: outB, n: keys.length };
         }
+
         return { push, prices, aligned };
     }
     /* ───────── 行情 → 序列（事件驱动） ───────── */
