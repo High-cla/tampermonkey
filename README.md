@@ -575,3 +575,13 @@ backtest-unified   数字逐位一致
 - FX Quant 凯利：1,000 组随机交易历史对照旧实现，全部通过。
 
 这些是独立的数值等价测试，不是浏览器端性能 benchmark。当前没有报告真实页面 CPU、长时间堆内存或端到端耗时的改进百分比；仍应在目标浏览器和真实行情/回放 workload 下测量。
+
+## 性能监测与 API 探测工具
+
+- 性能基准与 Edge 兼容性验收：[docs/performance-benchmark.md](docs/performance-benchmark.md)
+- 页面级性能采样器：[tools/toy-performance-monitor.user.js](tools/toy-performance-monitor.user.js)
+- Kurumi 公共 Store 只读探测器：[tools/kurumi-public-api-probe.user.js](tools/kurumi-public-api-probe.user.js)
+- Ring Buffer 原语回归测试：`node --test tests/*.test.mjs`
+- Ring Buffer 微基准：`node tests/benchmark-primitives.mjs`
+
+说明：页面采样器和只读探测器是独立开发工具，不会触发交易动作。微基准不是游戏页性能结论；真实性能仍以 Edge DevTools Performance 录制为准。

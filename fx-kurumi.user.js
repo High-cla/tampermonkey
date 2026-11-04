@@ -161,6 +161,36 @@
             } },
         };
     }
+    /* ───────── 固定容量环形缓冲区 ───────── */
+    function createRingBuffer(capacity) {
+        if (!Number.isInteger(capacity) || capacity < 1)
+            throw new RangeError('capacity must be a positive integer');
+        const values = new Array(capacity);
+        let head = 0, length = 0;
+        return {
+            push(value) {
+                let evicted;
+                if (length === capacity) {
+                    evicted = values[head];
+                    values[head] = value;
+                    head = (head + 1) % capacity;
+                }
+                else {
+                    values[(head + length) % capacity] = value;
+                    length++;
+                }
+                return evicted;
+            },
+            at(index) {
+                const i = index < 0 ? length + index : index;
+                if (i < 0 || i >= length)
+                    return undefined;
+                return values[(head + i) % capacity];
+            },
+            get length() { return length; },
+            clear() { values.fill(undefined); head = 0; length = 0; },
+        };
+    }
     /* MATH:BEGIN —— 纯函数，自包含（不引用块外符号），backtest.mts 直接切片复用 */
     const MIN_SPREAD_LEN = 8;
     function mean(v) { if (!v.length)
